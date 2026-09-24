@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Data is never committed (see data/README.md)
+data/*
+!data/README.md
+
+# Experiment outputs are written to the working directory
+*.csv
+*.parquet
+*.pdf
+*.png
+tables.tex
+!figures/*.png
