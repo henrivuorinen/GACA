@@ -90,7 +90,7 @@ def run_seed(seed, X, y):
     X_test = scaler.transform(X_test)
 
     # ---------- Solar Genesis ----------
-    gaca = GACA(gamma_clustering=GAMMA, n_iterations=N_ITER,
+    gaca = GACA(assignment='newton', method='barnes_hut', gamma_clustering=GAMMA, n_iterations=N_ITER,
                                epsilon=EPSILON, sample_size=CORESET,
                                random_state=seed, eta=ETA,
                                min_expert_size=MIN_EXPERT)

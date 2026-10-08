@@ -2,9 +2,10 @@
 row, and an optional Mixture of Experts (one local model per Sun)."""
 import numpy as np
 from sklearn.base import BaseEstimator
+from scipy.spatial import cKDTree
 from sklearn.linear_model import Ridge, LogisticRegression
 
-from .genesis import solar_genesis
+from .genesis import kernel_pull, saddle_link, solar_genesis
 
 
 class GACA(BaseEstimator):
@@ -18,12 +19,31 @@ class GACA(BaseEstimator):
 
     Input is expected to be standardised and low-dimensional (roughly d <= 10;
     project with PCA first if needed, see the README).
+
+    Assignment (``assignment``):
+
+    * ``'pull'`` (default). A row goes to the Sun whose coreset members exert
+      the largest Gaussian pull on it, sum_{j in Sun k} exp(-gamma ||x - z_j||^2),
+      over its ``n_neighbors`` nearest coreset members. This keeps the shape the
+      dynamics produced (crescents, rings) instead of cutting space into
+      Voronoi-like cells. A row on which the total pull is below ``kappa_``
+      would not move if it were inserted into the coreset (thesis Prop. 3.8), so
+      it is a Lone Sun: ``assign`` registers it as a new Lone Sun, or adds it to
+      an earlier one that pulls it. Anomalies therefore no longer have to be in
+      the coreset to be isolated.
+    * ``'newton'``. The thesis rule, argmax_k M_k / d_k^2.
+
+    ``kappa`` is relative: the absolute threshold ``kappa_`` is ``kappa`` times
+    the median external pull at the coreset members, so it is unaffected by the
+    choice of gamma, dimension and coreset size.
     """
 
     def __init__(self, gamma_clustering=1.0, n_iterations=20,
                  theta=0.5, epsilon=0.05, sample_size=5000,
                  task_type='regression', random_state=None, eta=0.5,
-                 min_expert_size=10, verbose=False):
+                 min_expert_size=10, verbose=False, method='exact',
+                 assignment='pull', kappa=1e-3, link_tau=None, n_neighbors=32,
+                 lone_share=1e-3):
         self.gamma_clustering = gamma_clustering
         self.n_iterations = n_iterations
         self.theta = theta
@@ -38,13 +58,18 @@ class GACA(BaseEstimator):
         # the behaviour thesis section 4.3.4 describes.
         self.min_expert_size = min_expert_size
         self.verbose = verbose
-
-        # State variables
-        self.suns_ = None
-        self.sun_masses_ = None
-        self.local_models_ = []
-        self.global_model_ = None
-        self.n_iters_ = None
+        # 'exact' (vectorised, no approximation) or 'barnes_hut' (thesis tree).
+        self.method = method
+        self.assignment = assignment
+        self.kappa = kappa
+        # If set, Suns joined by a density bridge of at least link_tau x the
+        # lower peak are merged after genesis (see genesis.saddle_link).
+        self.link_tau = link_tau
+        self.n_neighbors = n_neighbors
+        # A genesis Sun holding at most this share of the coreset (and at least
+        # mass 1) counts as a Lone Sun. The thesis definition is mass == 1, which
+        # misses a rare anomaly group once two of its copies are sampled.
+        self.lone_share = lone_share
 
     def _log(self, msg):
         if self.verbose:
@@ -52,6 +77,9 @@ class GACA(BaseEstimator):
 
     def fit(self, X, y=None):
         """Solar Genesis on a coreset, then (if ``y`` is given) local experts."""
+        if self.assignment not in ('pull', 'newton'):
+            raise ValueError(f"assignment must be 'pull' or 'newton', got {self.assignment!r}")
+        X = np.asarray(X, dtype=float)
         n_samples = X.shape[0]
 
         # 1. Subsampling (coreset extraction)
@@ -64,26 +92,58 @@ class GACA(BaseEstimator):
 
         self._log(f"Fitting GACA: running Solar Genesis on {len(X_core)} points...")
 
-        # 2. Barnes-Hut gravity with merging: the Suns and their accumulated masses
-        self.suns_, self.sun_masses_, self.n_iters_ = solar_genesis(
+        # 2. Solar Genesis: the Suns, their accumulated masses, and the Sun each
+        #    coreset row condensed into
+        self.suns_, self.sun_masses_, self.n_iters_, members = solar_genesis(
             X_core,
             gamma=self.gamma_clustering,
             n_iterations=self.n_iterations,
             theta=self.theta,
             epsilon=self.epsilon,
             eta=self.eta,
+            method=self.method,
             return_iters=True,
+            return_members=True,
             verbose=self.verbose,
         )
 
         self._log(f"Solar Genesis complete: {len(self.suns_)} Suns identified "
                   f"in {self.n_iters_} iterations.")
 
+        # 2b. Pull-based assignment structures: the coreset members keep the label
+        # of the Sun they condensed into, and the Lone-Sun threshold is set
+        # relative to the typical pull inside the coreset.
+        if self.assignment == 'pull':
+            w = np.ones(len(X_core))
+            pull = kernel_pull(X_core, X_core, w, self.gamma_clustering) - w
+            self.kappa_ = self.kappa * float(np.median(pull))
+
+            if self.link_tau is not None and len(self.suns_) > 1:
+                new_label, _ = saddle_link(X_core, members, w, self.gamma_clustering,
+                                           tau=self.link_tau, kappa=self.kappa_,
+                                           pull=pull)
+                M = np.bincount(new_label, weights=self.sun_masses_)
+                self.suns_ = np.column_stack([
+                    np.bincount(new_label, weights=self.sun_masses_ * self.suns_[:, j])
+                    for j in range(self.suns_.shape[1])]) / M[:, None]
+                self.sun_masses_ = M
+                members = new_label[members]
+                self._log(f"Saddle linking: {len(new_label)} -> {len(M)} Suns.")
+
+            self.core_ = X_core.copy()
+            self.core_labels_ = members
+            self.core_tree_ = cKDTree(self.core_)
+        self.n_genesis_suns_ = len(self.suns_)
+        self.lone_pos_ = np.empty((0, X.shape[1]))
+        self.lone_labels_ = np.empty(0, dtype=int)
+
         # 3. Local expert models. The WHOLE training set (not just the coreset)
-        # is assigned to the Suns to train them.
+        # is assigned to the Suns to train them. Rows that no Sun pulls are left
+        # to the global model.
         if y is not None:
             self._log("Training local expert models...")
-            assignments = self._assign_to_suns(X)
+            y = np.asarray(y)
+            assignments = self._route(X)
             self.local_models_ = []
 
             # Global fallback. Every Sun that receives no training point at all
@@ -131,15 +191,97 @@ class GACA(BaseEstimator):
     def assign(self, X, return_pull=False):
         """Particle Accretion: the index of the Sun each row of X belongs to.
 
-        Uses the Newtonian pull M_k / d^2. Rows can be passed in batches of any
-        size, so arbitrarily large data can be streamed through a fitted model.
-        With ``return_pull`` the winning pull strength is returned as well.
+        Rows can be passed in batches of any size, so arbitrarily large data can
+        be streamed through a fitted model. With ``assignment='pull'``, rows that
+        no Sun pulls become Lone Suns with labels from ``n_genesis_suns_``
+        upwards. Lone Suns persist across calls, so later copies of an anomaly
+        join the Lone Sun of the first. With ``return_pull`` the total Gaussian
+        pull (``'pull'``) or the winning Newtonian pull (``'newton'``) is
+        returned as well.
         """
-        return self._assign_to_suns(X, return_pull=return_pull)
+        X = np.asarray(X, dtype=float)
+        if self.assignment == 'newton':
+            return self._assign_to_suns(X, return_pull=return_pull)
+        labels, pull = self._pull_route(X)
+        lone = np.flatnonzero(labels < 0)
+        if len(lone):
+            labels[lone] = self._register_lone(X[lone])
+        return (labels, pull) if return_pull else labels
 
     def fit_assign(self, X):
         """Fit on X and return the Sun label of every row."""
         return self.fit(X).assign(X)
+
+    @property
+    def n_suns_(self):
+        """Number of Suns, including Lone Suns registered by ``assign``."""
+        return self.n_genesis_suns_ + len(np.unique(self.lone_labels_))
+
+    def is_lone(self, labels):
+        """True where a label is a Lone Sun: one registered by ``assign``, or a
+        genesis Sun whose coreset mass is at most max(1, lone_share x coreset)."""
+        labels = np.asarray(labels)
+        out = labels >= self.n_genesis_suns_
+        core = ~out
+        limit = max(1.0, self.lone_share * self.sun_masses_.sum())
+        out[core] = self.sun_masses_[labels[core]] <= limit
+        return out
+
+    def _route(self, X):
+        """Labels without registering new Lone Suns (-1 where nothing pulls)."""
+        if self.assignment == 'newton':
+            return self._assign_to_suns(X)
+        return self._pull_route(X)[0]
+
+    def _pull_route(self, X):
+        """Per-Sun Gaussian pull of the nearest coreset members.
+
+        Returns the strongest-pulling genesis Sun (-1 if the total pull is below
+        ``kappa_``) and the total pull of every row.
+        """
+        n, n_suns = len(X), self.n_genesis_suns_
+        K = min(self.n_neighbors, len(self.core_))
+        labels = np.empty(n, dtype=int)
+        total = np.empty(n)
+        chunk = max(1000, int(2e7 // max(n_suns, 1)))   # bounds the n x K pull table
+        for s in range(0, n, chunk):
+            Xc = X[s:s + chunk]
+            dist, idx = self.core_tree_.query(Xc, k=K, workers=-1)
+            if K == 1:
+                dist, idx = dist[:, None], idx[:, None]
+            W = np.exp(-self.gamma_clustering * dist ** 2)
+            S = self.core_labels_[idx]
+            acc = np.zeros((len(Xc), n_suns))
+            rows = np.arange(len(Xc))
+            for c in range(K):
+                acc[rows, S[:, c]] += W[:, c]
+            labels[s:s + chunk] = acc.argmax(axis=1)
+            total[s:s + chunk] = W.sum(axis=1)
+        labels[total < self.kappa_] = -1
+        return labels, total
+
+    def _register_lone(self, X_lone):
+        """Give each unpulled row a Lone Sun: the existing Lone Sun that pulls it
+        at least ``kappa_``, or a new one. Rows are taken in order; this is
+        meant for the rare rows that no genesis Sun pulls."""
+        out = np.empty(len(X_lone), dtype=int)
+        pos, lab = list(self.lone_pos_), list(self.lone_labels_)
+        next_label = self.n_genesis_suns_ + (len(set(lab)))
+        for r, x in enumerate(X_lone):
+            best = -1
+            if pos:
+                w = np.exp(-self.gamma_clustering * np.sum((np.asarray(pos) - x) ** 2, axis=1))
+                acc = np.bincount(np.asarray(lab) - self.n_genesis_suns_, weights=w)
+                if acc.max() >= self.kappa_:
+                    best = int(acc.argmax()) + self.n_genesis_suns_
+            if best < 0:
+                best, next_label = next_label, next_label + 1
+            pos.append(x)
+            lab.append(best)
+            out[r] = best
+        self.lone_pos_ = np.asarray(pos).reshape(-1, X_lone.shape[1])
+        self.lone_labels_ = np.asarray(lab, dtype=int)
+        return out
 
     def _assign_to_suns(self, X_batch, return_pull=False):
         """Vectorised Newtonian assignment (Mass / r^2) of rows to Suns.
@@ -162,10 +304,12 @@ class GACA(BaseEstimator):
     def predict(self, X_new):
         """Predict with the expert of each row's Sun (hard routing).
 
-        Rows routed to a Sun that received no training point are predicted by the
+        Rows routed to a Sun that received no training point, and (with
+        ``assignment='pull'``) rows that no Sun pulls, are predicted by the
         global fallback model, not by 0.0.
         """
-        assignments = self._assign_to_suns(X_new)
+        X_new = np.asarray(X_new, dtype=float)
+        assignments = self._route(X_new)
         predictions = self.global_model_.predict(X_new)
 
         for i, (kind, local) in enumerate(self.local_models_):

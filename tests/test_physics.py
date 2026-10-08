@@ -76,3 +76,21 @@ def _plot():
 
 if __name__ == "__main__":
     _plot()
+
+
+def test_exact_and_barnes_hut_agree():
+    X = _three_blobs()
+    s1, m1 = solar_genesis(X, gamma=GAMMA, n_iterations=N_ITER, theta=THETA,
+                           epsilon=EPSILON, method='barnes_hut')
+    s2, m2 = solar_genesis(X, gamma=GAMMA, n_iterations=N_ITER, theta=THETA,
+                           epsilon=EPSILON, method='exact')
+    assert len(s1) == len(s2)
+    assert np.allclose(np.sort(m1), np.sort(m2))
+
+
+def test_members_point_to_the_sun_each_row_condensed_into():
+    X = _three_blobs()
+    suns, masses, members = solar_genesis(X, gamma=GAMMA, n_iterations=N_ITER,
+                                          epsilon=EPSILON, return_members=True)
+    assert members.shape == (len(X),)
+    assert np.array_equal(np.bincount(members, minlength=len(suns)), masses)

@@ -145,7 +145,7 @@ def main(path, chunksize=50000):
     print("Solar Genesis on coreset...")
     t_gen = time.time()
     suns, masses, n_iters = solar_genesis(
-        scaler.transform(coreset_raw), gamma=GAMMA, n_iterations=N_ITER,
+        scaler.transform(coreset_raw), method='barnes_hut', gamma=GAMMA, n_iterations=N_ITER,
         theta=THETA, epsilon=EPS, eta=ETA, return_iters=True)
     genesis_s = time.time() - t_gen
     K = len(suns)

@@ -69,7 +69,7 @@ def run(gamma, eps=None, eta=None):
 
     snaps = []
     with contextlib.redirect_stdout(open(os.devnull, 'w')):
-        solar_genesis(core, gamma=gamma, n_iterations=N_ITER, theta=THETA,
+        solar_genesis(core, method='barnes_hut', gamma=gamma, n_iterations=N_ITER, theta=THETA,
                            epsilon=eps, eta=eta, snapshots=snaps)
     return core, snaps
 

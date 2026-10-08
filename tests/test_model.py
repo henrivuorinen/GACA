@@ -1,6 +1,8 @@
 """Checks for the GACA estimator (coreset, assignment, Mixture of Experts)."""
 import numpy as np
-from sklearn.datasets import make_blobs
+from sklearn.datasets import make_blobs, make_moons
+from sklearn.metrics import adjusted_rand_score
+from sklearn.preprocessing import StandardScaler
 
 from gaca import GACA, assign
 
@@ -31,7 +33,13 @@ def test_assign_labels_every_row():
     model = GACA(sample_size=200, random_state=0).fit(X)
     labels = model.assign(X)
     assert labels.shape == (len(X),)
-    assert labels.min() >= 0 and labels.max() < len(model.suns_)
+    assert labels.min() >= 0 and labels.max() < model.n_suns_
+
+
+def test_newton_assignment_matches_thesis_rule():
+    X, _ = _data()
+    model = GACA(sample_size=200, random_state=0, assignment='newton').fit(X)
+    labels = model.assign(X)
     assert np.array_equal(labels, assign(X, model.suns_, model.sun_masses_))
 
 
@@ -41,3 +49,33 @@ def test_mixture_of_experts_predicts_finite_values():
     pred = model.predict(X)
     assert pred.shape == y.shape
     assert np.all(np.isfinite(pred))
+
+
+def test_unsampled_anomaly_becomes_lone_sun_and_copies_join_it():
+    X, _ = _data()
+    anomaly = np.array([[40.0, 40.0], [40.01, 40.0], [-40.0, 40.0]])
+    model = GACA(sample_size=200, random_state=0).fit(X)   # anomalies not in coreset
+    genuine = model.assign(X)
+    labels = model.assign(anomaly)
+    assert not model.is_lone(genuine).any()
+    assert model.is_lone(labels).all()
+    assert labels[0] == labels[1] != labels[2]              # copies share one Lone Sun
+    assert model.assign(anomaly[:1])[0] == labels[0]        # persists across batches
+
+
+def test_saddle_linking_recovers_non_convex_clusters():
+    X, y = make_moons(3000, noise=0.06, random_state=0)
+    X = StandardScaler().fit_transform(X)
+    newton = GACA(gamma_clustering=10, sample_size=1000, random_state=0,
+                  assignment='newton').fit(X)
+    linked = GACA(gamma_clustering=10, sample_size=1000, random_state=0,
+                  link_tau=0.6).fit(X)
+    assert adjusted_rand_score(y, newton.assign(X)) < 0.5
+    assert adjusted_rand_score(y, linked.assign(X)) > 0.95
+
+
+def test_unpulled_rows_are_predicted_by_the_global_model():
+    X, y = _data()
+    model = GACA(sample_size=200, random_state=0).fit(X, y)
+    far = np.array([[100.0, -100.0]])
+    assert np.allclose(model.predict(far), model.global_model_.predict(far))

@@ -86,7 +86,7 @@ def run_seed(seed, path, chunksize, n_total):
         t0 = time.time()
         with contextlib.redirect_stdout(open(os.devnull, 'w')):
             suns, masses, n_iters = solar_genesis(
-                core, gamma=GAMMA, n_iterations=N_ITER, theta=THETA, epsilon=EPS,
+                core, method='barnes_hut', gamma=GAMMA, n_iterations=N_ITER, theta=THETA, epsilon=EPS,
                 eta=ETA, return_iters=True)
         gen_s = time.time() - t0
         labels = assign(eval_set, suns, masses)

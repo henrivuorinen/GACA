@@ -45,7 +45,7 @@ def main(path, gamma):
     core = Xs[rng.choice(len(Xs), min(CORESET, len(Xs)), replace=False)]
     print(f"Clustering {len(df):,} companies (gamma={gamma})...")
     with contextlib.redirect_stdout(open(os.devnull, 'w')):
-        suns, masses = solar_genesis(core, gamma=gamma, n_iterations=N_ITER,
+        suns, masses = solar_genesis(core, method='barnes_hut', gamma=gamma, n_iterations=N_ITER,
                                           theta=THETA, epsilon=EPS, eta=ETA)
         labels = assign(Xs, suns, masses)
     df['sun'] = labels

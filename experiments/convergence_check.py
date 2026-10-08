@@ -95,7 +95,7 @@ def main(path):
         t0 = time.time()
         with contextlib.redirect_stdout(open(os.devnull, 'w')):
             suns, masses, iters = solar_genesis(
-                core, gamma=gamma, n_iterations=LONG_ITERS, theta=THETA,
+                core, method='barnes_hut', gamma=gamma, n_iterations=LONG_ITERS, theta=THETA,
                 epsilon=EPS, eta=ETA, return_iters=True, history=hist)
         elapsed = time.time() - t0
 

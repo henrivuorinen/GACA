@@ -97,7 +97,7 @@ def run_seed(seed, X, y):
 
     rows = []
     for gamma in GAMMAS:
-        gaca = GACA(gamma_clustering=gamma, n_iterations=N_ITER,
+        gaca = GACA(assignment='newton', method='barnes_hut', gamma_clustering=gamma, n_iterations=N_ITER,
                                    epsilon=EPSILON, sample_size=CORESET,
                                    random_state=seed, eta=ETA,
                                    min_expert_size=MIN_EXPERT)

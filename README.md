@@ -13,7 +13,11 @@ records in about 23 seconds on a laptop, with constant memory**.
 
 This repository contains the reference implementation from the master's thesis
 *The Gravitational Accretion Clustering Algorithm (GACA): Scalable,
-Physics-Inspired Clustering for Large Datasets*.
+Physics-Inspired Clustering for Large Datasets*, plus several improvements made
+after it (see [Improvements since the thesis](#improvements-since-the-thesis)).
+The thesis behaviour is still available with
+`GACA(assignment='newton', method='barnes_hut')`, and every script in
+`experiments/` uses it.
 
 ![Solar Genesis: 3,000 particles condensing into 7 Suns](figures/accretion_evolution.png)
 
@@ -30,20 +34,35 @@ iteration:
    component is replaced by one particle at its centre of mass, carrying the
    summed mass. Mass is conserved exactly.
 
-A Barnes-Hut tree (a KD-tree whose nodes cache total mass and centre of mass)
-treats distant groups of particles as single bodies, so an iteration costs about
-O(n log n) instead of O(n²). Genesis stops at a stable plateau or at the
-iteration cap. The surviving particles are the Suns.
+The Gaussian sum is evaluated exactly in vectorised blocks (`method='exact'`,
+the default). The thesis used a Barnes-Hut tree (`method='barnes_hut'`), which is
+asymptotically cheaper but in interpreted Python is 90 to 140 times slower on
+the coresets GACA uses, and only approximate. Genesis stops at a stable plateau
+or at the iteration cap. The surviving particles are the Suns, and every
+coreset row remembers which Sun it condensed into.
 
 **Phase 2: Particle Accretion (assignment of every row).** Each row is assigned
-to the Sun with the strongest pull, `M_k / d²`. This is O(N) time, and because it
-works batch by batch, memory depends on the batch size rather than on N. The
-Suns themselves never change after genesis.
+to the Sun whose coreset members exert the strongest Gaussian pull on it,
+`Σ_{j ∈ Sun k} exp(−γ‖x − z_j‖²)`, summed over its 32 nearest coreset members.
+This follows the shape the dynamics found rather than cutting space into
+Voronoi cells. It is O(N log n_c) time and works batch by batch, so memory
+depends on the batch size rather than on N. (`assignment='newton'` restores
+the thesis rule, `M_k / d²`.)
 
 **Lone Suns (anomalies).** A point far from everything feels essentially no
 Gaussian pull, never moves and never merges. It survives as a Sun of mass 1: a
-Lone Sun. Anomaly isolation is a side effect of the same dynamics, not a
-separate detector.
+Lone Sun. Assignment applies the same test to every streamed row: if the total
+pull on it is below `kappa_`, the row would not have moved had it been in the
+coreset (thesis Prop. 3.8), so it becomes a new Lone Sun, or joins an earlier
+Lone Sun that pulls it. Anomalies therefore no longer need to be in the coreset
+to be isolated.
+
+**Saddle linking (optional, `link_tau`).** At a fine bandwidth a curved or
+elongated cluster splits into a chain of Suns. With `link_tau` set, two Suns
+are joined when the density along the best edge between their members stays
+above `link_tau` times the lower of their two peaks, so the decision rests on
+the mass lying between the Suns rather than the distance between them. Lone
+Suns are never joined.
 
 ## Installation
 
@@ -68,10 +87,11 @@ X = StandardScaler().fit_transform(X_raw)   # standardise first
 
 model = GACA(gamma_clustering=1.0, random_state=0).fit(X)
 labels = model.assign(X)                    # Sun index for every row
+anomalies = model.is_lone(labels)           # rows in Lone Suns
 
-model.suns_          # (k, d) Sun positions
+model.suns_          # (k, d) positions of the Suns found by genesis
 model.sun_masses_    # (k,) mass each Sun accumulated from the coreset
-lone_suns = np.flatnonzero(model.sun_masses_ == 1)
+model.n_suns_        # k plus the Lone Suns registered by assign
 ```
 
 A runnable demo on synthetic data (five groups plus planted anomalies, compared
@@ -92,12 +112,15 @@ for chunk in pd.read_csv("big.csv", chunksize=100_000):
     labels = model.assign(scaler.transform(chunk[features].values))
 ```
 
+Lone Suns registered in one chunk persist, so later copies of the same anomaly
+receive the same label.
+
 ### Mixture of Experts
 
 Passing a target to `fit` trains one Ridge regression per Sun (logistic
 regression with `task_type='classification'`). `predict` routes each row to its
 Sun's expert. Suns with fewer than `min_expert_size` training rows predict their
-mean, and empty Suns fall back to a global model.
+mean. Empty Suns, and rows that no Sun pulls, fall back to a global model.
 
 ```python
 model = GACA(random_state=0).fit(X_train, y_train)
@@ -113,13 +136,21 @@ y_pred = model.predict(X_test)
 | `eta` | 0.5 | Damping η of the transport step |
 | `sample_size` | 5000 | Coreset size for Solar Genesis |
 | `n_iterations` | 20 | Iteration cap for genesis |
-| `theta` | 0.5 | Barnes-Hut opening angle. Larger is faster and less exact |
+| `theta` | 0.5 | Barnes-Hut opening angle (only with `method='barnes_hut'`) |
+| `method` | `'exact'` | Genesis kernel sum: `'exact'` (vectorised) or `'barnes_hut'` (thesis) |
+| `assignment` | `'pull'` | `'pull'` (member pull, Lone-Sun registration) or `'newton'` (thesis `M/d²`) |
+| `kappa` | 1e-3 | Lone-Sun threshold, relative to the median pull inside the coreset |
+| `link_tau` | None | Saddle-linking ratio; e.g. 0.6 together with γ ≈ 10 for non-convex clusters |
+| `n_neighbors` | 32 | Coreset members used for the pull of each row |
+| `lone_share` | 1e-3 | A genesis Sun with at most this share of the coreset counts as a Lone Sun |
 | `min_expert_size` | 10 | Minimum rows for a Sun to get its own regression expert |
 | `random_state` | None | Seed for the coreset draw |
 | `verbose` | False | Print progress |
 
 The lower-level functions are also exported: `solar_genesis` (the simulation on
-its own), `assign` (Newtonian assignment given Suns and masses), `GACANode` and
+its own; `return_members=True` gives the Sun of every input row, `plateau=w` adds
+the plateau stopping rule), `assign` (Newtonian assignment given Suns and
+masses), `kernel_pull`, `saddle_link`, `GACANode` and
 `merge_connected_components`.
 
 ## Practical guidance
@@ -131,15 +162,16 @@ its own), `assign` (Newtonian assignment given Suns and masses), `GACANode` and
   and shattered into 1,377 singletons; PCA to 5 dimensions took 33 seconds.
 - **Choose γ from the plateau.** Sweep γ and pick a value where the Sun count is
   stable. γ = 1.0 sat in the stable band on the thesis data.
-- **Use it at scale.** GACA's cost is dominated by a fixed genesis step (about
-  20 seconds in pure Python), so below a few hundred thousand rows HDBSCAN is
-  faster. The advantage appears at large N.
-- **Anomalies need to be in the coreset to become Lone Suns.** An anomaly that is
-  not sampled is assigned to its strongest-pull Sun. To catch those, flag rows
-  whose distance to their Sun exceeds that Sun's 95th percentile training
-  distance (the OOD rule used in the thesis; see `experiments/anomaly_recovery.py`).
-- **Pure Python.** The tree traversal is not compiled, so genesis on very large
-  coresets is slow. This is the most obvious place for a speed-up.
+- **Genesis is cheap now.** With the exact backend, genesis takes about 0.6 s on
+  a 5,000-point coreset and 28 s on 40,000 (the thesis reports 22.5 s and 370 s).
+- **Non-convex clusters: raise γ and link.** For crescents, rings or elongated
+  groups, use a finer bandwidth (γ ≈ 10 worked best) with `link_tau=0.6`. At
+  γ = 1 linking is unnecessary and can join adjacent groups; at γ = 30 the
+  coreset is too sparse for the bridge estimates and linking under-merges.
+- **Anomaly sensitivity.** `kappa` sets how little pull makes a row a Lone Sun.
+  Raising γ also makes more rows lone, since the kernel narrows; at very high γ
+  a small coreset cannot cover sparse tails and genuine rows start to be
+  flagged.
 
 ## Results from the thesis
 
@@ -156,13 +188,64 @@ its own), `assign` (Newtonian assignment given Suns and masses), `GACANode` and
 
 ![Runtime versus dataset size](figures/scalability_comparison.png)
 
+## Improvements since the thesis
+
+Measured with `experiments/improvements_benchmark.py` on synthetic data (20,000
+rows, coreset 2,000, γ = 1, 4 seeds, the nine planted anomaly groups of
+Sec. 6.4). *Detected* is the share of anomaly groups whose every copy ends up
+in a Lone Sun; *FP* is the share of genuine rows flagged; *R²* is the Mixture of
+Experts on a fresh test set with new anomalies.
+
+| Data | Method | Detected | FP | ARI | R² |
+|---|---|---|---|---|---|
+| blobs | thesis (`M/d²`) | 0.19 | 0.00% | 0.990 | 0.963 |
+| blobs | thesis + OOD95 rule | 1.00 | 4.87% | 0.990 | 0.936 |
+| blobs | **pull (new default)** | 0.97 | **0.00%** | **0.994** | **0.974** |
+| company-like | thesis (`M/d²`) | 0.22 | 0.01% | 0.080 | 0.397 |
+| company-like | thesis + OOD95 rule | 1.00 | 4.89% | 0.080 | 0.395 |
+| company-like | **pull (new default)** | **1.00** | 0.35% | 0.173 | **0.579** |
+| company-like | pull, γ = 5, `link_tau=0.6` | 1.00 | 2.82% | 0.579 | 0.712 |
+
+What changed and why:
+
+1. **Exact vectorised genesis.** Same Suns as the Barnes-Hut version (to within a
+   unit of mass), no approximation error, and 90 to 140 times faster in this
+   implementation. This also settles the "approximation bounds" limitation: the
+   default operator is exact.
+2. **Anomalies no longer depend on the coreset.** The thesis found that an
+   unsampled anomaly is never isolated, and that the OOD rule that catches them
+   also flags 5% of genuine rows by construction (about 1,000 false alarms per
+   20,000 rows). The pull test catches them at 0 to 0.35% false positives,
+   independently of the coreset size, and groups the copies of one anomaly
+   into a single Lone Sun.
+3. **Assignment follows the dynamics.** Routing by the pull of each Sun's
+   members instead of `M_k / d²` improved the downstream Mixture of Experts
+   (R² 0.40 to 0.58 on the company-like data), and rows that no Sun pulls are
+   sent to the global model instead of a wrong local expert.
+4. **Saddle linking** recovers non-convex clusters that the flat output could
+   not express (two moons and concentric circles at γ = 10: ARI 0.2 to 0.5
+   without, 0.99 to 1.0 with `link_tau=0.6`, over 4 seeds), and widens the
+   usable γ range (five blobs at ARI ≥ 0.94 for γ = 3 to 10, where unlinked
+   γ = 10 shatters them into 300 Suns). It is not uniformly safe: at γ = 1 it
+   can join adjacent groups, and at γ = 30 it under-merges.
+5. **Relative Lone-Sun threshold** (`kappa` as a fraction of the median pull) so
+   that one setting works across bandwidths, dimensions and coreset sizes.
+6. **Lone Sun by share, not by mass 1.** Once two copies of a rare group are
+   sampled, the thesis definition (mass 1) no longer counts it as an anomaly.
+
+Remaining caveats: the 5σ misses in the table are planted points within about
+one unit of genuine data, where the kernel does not consider them separate.
+The real company data was not available for these tests, so the thesis
+numbers should be re-run before the new defaults are trusted on that data.
+
 ## Repository layout
 
 ```
 gaca/            the package: Solar Genesis, assignment, GACA estimator
 tests/           pytest suite (mass conservation, Lone Suns, estimator)
 examples/        runnable demo on synthetic data
-experiments/     the scripts behind every thesis table and figure
+experiments/     the scripts behind every thesis table and figure, plus
+                 improvements_benchmark.py (thesis vs current defaults)
 figures/         images used in this README
 data/            empty; put your own data here (git-ignored)
 ```
@@ -211,12 +294,14 @@ python experiments/plot_phase_transition.py sweep_results_eta0.5.csv
 
 ## Limitations
 
-- The Barnes-Hut acceptance rule has no uniform error bound for a Gaussian kernel.
-  It works in practice because distant contributions are exponentially small, but
-  it is a heuristic.
+- The Barnes-Hut acceptance rule (`method='barnes_hut'`) has no uniform error
+  bound for a Gaussian kernel. The default exact backend avoids it, at O(n²) per
+  iteration, which is fine up to coresets of a few tens of thousands.
 - There is no global optimality guarantee, and the result is the state at the
   stopping time (the stopping rule is part of the algorithm).
-- A uniform coreset can miss rare structure, including anomalies.
+- A uniform coreset can miss rare structure. Isolated anomalies are recovered at
+  assignment time, but a small genuine cluster missed by the coreset becomes a
+  set of Lone Suns rather than a regular Sun.
 - Only low-dimensional inputs are practical; use a projection first.
 
 ## Citation
