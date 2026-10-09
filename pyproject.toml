@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "gaca"
 dynamic = ["version"]
 description = "Gravitational Accretion Clustering: physics-inspired clustering and anomaly detection for large tables"
-readme = "README.md"
+readme = "PYPI.md"         # short page for PyPI; GitHub shows README.md
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Henri J. Vuorinen" }]

@@ -123,11 +123,13 @@ What it decides, and how:
 | Columns | Numeric columns are used. Text, identifiers (unique integers named like `id` or strictly increasing), constant columns and columns more than 50% missing are left out. `columns=` / `exclude=` override. |
 | Missing values | Median of the column. |
 | Transforms | `log1p` for count- or flux-like columns: non-negative, skewed, and spanning more than an order of magnitude. Other skewed columns are left alone, since a log would also pull genuine outliers back towards the data. |
-| Scaling | Median and interquartile range, so outliers do not compress everything else. `scale='none'` (`--scale none`) keeps the values as they are, for data whose distances already mean something, such as positions in physical units. |
+| Scaling | Median and interquartile range, so outliers do not compress everything else. A column whose values form clearly separate groups (a 1-D Gaussian mixture, groups of at least 5% of rows, Ashman's D > 2) is scaled by the spread inside the groups instead, since its interquartile range spans the gaps and would squeeze it. `scale='none'` (`--scale none`) keeps the values as they are, for data whose distances already mean something, such as positions in physical units. |
 | Dimensions | Unchanged up to `max_dims` columns (default 10). Above that, PCA to between 5 and `max_dims` components, the number set by the noise floor of the singular values (Gavish and Donoho). |
 | γ | Swept as c / (median squared distance between rows). At each value GACA is fitted on four subsamples. γ is the middle of the most stable stretch of the longest plateau in the cluster count. A split only counts if the subsamples agree (adjusted Rand index ≥ 0.8). Otherwise the answer is one group. |
 | Anomalies | Rows that no cluster pulls, plus clusters smaller than `min_cluster_size` (10 rows). Score = −log10 of the pull relative to a typical row; above 3 is anomalous. |
 | Hierarchy | Every stable resolution of the sweep is kept, fitted on the same coreset and nested into a tree: each fine cluster sits under the coarse cluster holding most of its particles, and each row is assigned within its own branch. `gaca_cluster` is the level the rule above picks; `gaca_level_1 … gaca_level_K` hold all levels as path-style names (`0`, `0.2`, `0.2.1`). `hierarchy=False` turns it off. |
+| Linked view | A second clustering with saddle linking (its own automatic γ), better for curved or elongated groups and worse for overlapping ones. It is in `gaca_linked_cluster`, and the report shows it when it disagrees with the main view. `link_view=False` / `--no-link-view` skips it. |
+| Speed | The sweep's fits and the hierarchy levels run in parallel threads (`n_jobs`, `--jobs`; up to 8 by default), with identical results. |
 
 How it did on data it was not tuned on (ARI against known labels; *best γ* is
 the best that any γ in the sweep achieved):
@@ -145,7 +147,12 @@ the best that any γ in the sweep achieved):
 | One Gaussian (no clusters) | 5,000 × 2 to 10 | 1 cluster | | correctly reports no structure and no anomalies |
 
 `link_tau` is not on by default: it joins curved clusters but also merges
-clusters that overlap (the 30-D case drops to 0.15 with it).
+clusters that overlap (the 30-D case drops to 0.15 with it). Instead, AutoGACA
+computes the linked clustering as an alternative view. When the two disagree,
+one of them was the good one on every benchmark set (moons 1.00, circles 0.96,
+anisotropic 0.99 and digits 0.39 from the linked view; wine 0.81, breast cancer
+0.36 and the 30-D case 0.90 from the main view). The report shows both, with
+guidance on which suits which shape of group.
 
 ### The cluster hierarchy
 
@@ -166,10 +173,16 @@ Two details make the tree reliable:
 - Between equally long, equally stable plateaus the finer one is used for
   `gaca_cluster`, since the coarser ones remain in the hierarchy.
 
-One caution: robust scaling divides each column by its own spread. A column
-whose values form far-apart groups therefore gets compressed, which can merge
-the subgroups along it. When all columns share a unit, `scale='none'` avoids
-this.
+Robust scaling divides each column by its spread, and for a column whose
+values form far-apart groups the interquartile range spans the gaps, which
+compresses the column and merged the subgroups along it. Such columns are
+therefore scaled by the spread inside their groups. In the test above (two
+groups of three subgroups), this raised the best level from ARI 0.66 to 0.98.
+Across the benchmark it improved breast cancer from 0.36 to 0.56, digits (best
+level) from 0.36 to 0.56, iris (best level) from 0.54 to 0.75, and the 30-D
+linked view from 0.15 to 0.87. It lowered the main view on the anisotropic set
+(0.67 to 0.32; the linked view stays at 0.99) and the SDSS linked view (0.61
+to 0.53). `separate_modes=False` restores plain robust scaling.
 
 To try it on real astronomy data, `examples/sdss/` downloads two public Sloan
 Digital Sky Survey tables (object properties, and galaxy positions around the
@@ -199,46 +212,49 @@ nothing is tuned per dataset with the labels.
 **Clustering** (adjusted Rand index; HDBSCAN with minimum cluster size 1% of
 rows, K-Means given the true k as a reference):
 
-| Data | GACA | GACA + link | HDBSCAN | K-Means (true k) |
+| Data | GACA | GACA, linked view | HDBSCAN | K-Means (true k) |
 |---|---|---|---|---|
-| wine | **0.81** | 0.00 | 0.53 | 0.86 |
-| breast cancer | **0.36** | 0.01 | 0.08 | 0.64 |
-| digits | 0.03 | **0.39** | 0.01 | 0.27 |
-| uneven blobs 5-D | **0.99** | 0.97 | 0.56 | 0.92 |
-| 6 clusters in 30-D noise | **0.90** | 0.15 | 0.13 | 0.90 |
-| varied density | 0.93 | **0.95** | 0.79 | 0.91 |
-| anisotropic | 0.67 | **0.99** | 0.95 | 0.66 |
-| two moons | 0.53 | **1.00** | **1.00** | 0.33 |
+| wine | **0.85** | 0.00 | 0.27 | 0.85 |
+| breast cancer | **0.56** | 0.01 | 0.08 | 0.69 |
+| digits | **0.18** | 0.17 | **0.18** | 0.52 |
+| uneven blobs 5-D | **0.99** | **0.99** | 0.71 | 0.98 |
+| 6 clusters in 30-D noise | **0.94** | 0.87 | 0.18 | 0.94 |
+| varied density | 0.93 | **0.95** | 0.78 | 0.90 |
+| anisotropic | 0.32 | **0.99** | 0.95 | 0.78 |
+| two moons | 0.60 | **1.00** | **1.00** | 0.56 |
 | circles | 0.53 | 0.96 | **1.00** | 0.00 |
-| SDSS objects (class) | 0.48 | **0.61** | **0.61** | 0.36 |
+| SDSS objects (class) | 0.48 | 0.53 | **0.61** | 0.35 |
 
-GACA is the stronger method on overlapping, Gaussian-like groups, varied
-densities and noisy dimensions. HDBSCAN is stronger on curved shapes, where
-GACA needs `link_tau`; with it, GACA matches or nearly matches HDBSCAN there
-and on the SDSS objects, and is the best method on digits. The two GACA modes
-are complementary, and linking is what fails on overlapping groups (wine drops
-to 0.00 with it). The ARI here is for the single level in `gaca_cluster`; the
-hierarchy often holds a better-matching level as well. GACA also assigns 90
-to 100% of rows, while HDBSCAN leaves up to 68% as noise. Neither a fixed linking ratio nor a significance
-test chose correctly between linking and not linking: GACA's dynamics
-separate overlapping groups that a density-dip test calls a single mode.
+GACA's main view is the stronger method on overlapping, Gaussian-like groups,
+varied densities and noisy dimensions. The linked view, which AutoGACA
+computes as well and shows when it disagrees, handles curved and elongated
+shapes, where it matches or nearly matches HDBSCAN. HDBSCAN stays ahead on
+circles and the SDSS objects. When the two GACA views disagree, one of them
+is the good one on every set here. GACA also assigns 90 to 100% of rows,
+while HDBSCAN leaves up to 68% as noise. All methods run on AutoGACA's
+preprocessed space, so its preprocessing helps them too: the within-group
+scaling raised K-Means on iris from 0.58 to 0.87 and on digits from 0.27 to
+0.52. K-Means, given the true number of clusters, remains the reference to
+beat on the classic labelled sets. The ARI is for the single level in
+`gaca_cluster`; the hierarchy often holds a better-matching level (iris 0.75,
+digits 0.56).
 
 **Anomaly detection** (average precision; ROC AUC in brackets):
 
 | Data | GACA | Isolation Forest | LOF | HDBSCAN |
 |---|---|---|---|---|
-| blobs + planted anomalies | **1.00** (1.00) | 0.97 (1.00) | **1.00** (1.00) | 0.44 (0.81) |
-| company-like + planted | **0.74** (1.00) | 0.62 (1.00) | 0.44 (0.99) | 0.45 (0.76) |
-| breast cancer, 5% malignant | **0.47** (0.95) | 0.34 (0.91) | 0.46 (0.94) | 0.05 (0.53) |
-| SDSS, quasars thinned to 1% | 0.14 (0.96) | **0.28** (0.95) | 0.02 (0.56) | 0.01 (0.52) |
-| SDSS, white dwarfs (~1%) | 0.04 (0.90) | **0.06** (0.94) | 0.01 (0.46) | 0.01 (0.52) |
-| KDD Cup 99 attacks | 0.05 (0.61) | **0.33** (0.80) | 0.03 (0.34) | 0.03 (0.34) |
+| blobs + planted anomalies | **1.00** (1.00) | 0.97 (1.00) | **1.00** (1.00) | 0.01 (0.67) |
+| company-like + planted | **0.84** (1.00) | 0.62 (1.00) | 0.76 (1.00) | 0.45 (0.76) |
+| breast cancer, 5% malignant | **0.47** (0.95) | 0.32 (0.91) | **0.47** (0.94) | 0.05 (0.53) |
+| SDSS, quasars thinned to 1% | 0.15 (0.96) | **0.32** (0.96) | 0.03 (0.55) | 0.02 (0.60) |
+| SDSS, white dwarfs (~1%) | 0.04 (0.90) | **0.06** (0.94) | 0.01 (0.47) | 0.01 (0.52) |
+| KDD Cup 99 attacks | 0.03 (0.41) | **0.36** (0.91) | 0.03 (0.36) | 0.03 (0.25) |
 
 GACA ranks isolated anomalies best and flags precisely: on the planted sets it
-flags 0.3% of rows and catches them all, where Isolation Forest flags 9 to 16%.
-It is weaker when the "anomalies" are a dense group of their own (a thousand
-similar quasars, or the floods of identical connections in KDD Cup, where all
-density methods fail).
+flags 0.2 to 0.7% of rows and catches them all, where Isolation Forest flags 9
+to 16%. It is weaker when the "anomalies" are a dense group of their own (a
+thousand similar quasars, or the floods of identical connections in KDD Cup,
+where all density methods fail).
 
 **Scale** (5-D data; seconds, and peak memory of the process):
 
