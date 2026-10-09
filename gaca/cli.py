@@ -59,7 +59,8 @@ def run(args):
     auto = AutoGACA(columns=_split(args.columns), exclude=_split(args.exclude),
                     scale=args.scale, max_dims=args.max_dims, gamma=gamma,
                     link_tau=args.link, sample_size=args.sample_size,
-                    bandwidth=args.bandwidth,
+                    bandwidth=args.bandwidth, n_jobs=args.jobs,
+                    link_view=not args.no_link_view,
                     random_state=args.seed, verbose=not args.quiet)
     t0 = time.time()
     labels_path = os.path.join(out, "labels.csv")
@@ -103,6 +104,9 @@ def run(args):
         epsilon=auto.model_.epsilon_, link_tau=auto.link_tau,
         clusters=[dict(cluster=int(k), rows=int(c)) for k, c in enumerate(counts)],
         anomalous_rows=int(n_anom), seconds=round(time.time() - t0, 1), note=note,
+        linked_view=None if auto.linked_labels_ is None else dict(
+            clusters=int(auto.linked_.n_clusters_), agreement_with_main=auto.link_agreement_,
+            gamma=auto.linked_.gamma_),
         hierarchy=[dict(level=i, gamma=lv['gamma'], clusters=int(lv['k']),
                         in_gaca_cluster=bool(lv['chosen']))
                    for i, lv in enumerate(auto.levels_, start=1)])
@@ -139,6 +143,10 @@ def main(argv=None):
     r.add_argument("--fit-rows", type=int, default=100_000,
                    help="with --chunksize: rows sampled to fit on (default 100000)")
     r.add_argument("--seed", type=int, default=0)
+    r.add_argument("--no-link-view", action="store_true",
+                   help="skip the alternative, linked clustering (saves a few seconds)")
+    r.add_argument("--jobs", type=int, default=None,
+                   help="threads for choosing gamma and the hierarchy (default: up to 8)")
     r.add_argument("--out", help="output directory (default <input>_gaca)")
     r.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)

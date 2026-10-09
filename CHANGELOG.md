@@ -4,6 +4,24 @@ Versions follow [semantic versioning](https://semver.org): bug fixes raise the
 last number, new features the middle one, and changes that break existing code
 the first.
 
+## 1.3.0
+
+### Added
+- **Linked view.** AutoGACA also clusters with saddle linking as an alternative,
+  stored in `gaca_linked_cluster` and shown in the report when it disagrees
+  with the main view. Turn it off with `link_view=False` or `--no-link-view`.
+- `n_jobs` / `--jobs`: the bandwidth sweep and the hierarchy fits run in
+  parallel threads. This is about 2x faster, with identical results.
+
+### Changed
+- **Within-group scaling.** A column whose values form clearly separate groups
+  is scaled by the spread inside the groups rather than by its interquartile
+  range, which spans the gaps and squeezed the column. This improved most
+  benchmark sets (breast cancer 0.36 to 0.56; nested groups 0.66 to 0.98).
+  `separate_modes=False` turns it off.
+- The PyPI page shows a short description (`PYPI.md`) instead of the full
+  README, which stays on GitHub.
+
 ## 1.2.0
 
 First release on PyPI (`pip install gaca`).

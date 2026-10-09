@@ -17,7 +17,9 @@ readable output:
     auto.result_         # DataFrame: cluster, anomaly, anomaly score per row
     auto.report("report.html")
 """
+import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 from scipy.spatial import cKDTree
@@ -98,6 +100,58 @@ def _path_key(name):
     return tuple(int(p) for p in name.split('.'))
 
 
+def _within_mode_spread(v, spread, random_state=0, max_n=5000, min_weight=0.05,
+                        min_sd_frac=0.01, min_d=2.0):
+    """The typical spread inside the groups of a column whose values form
+    clearly separated groups, or None.
+
+    A 1-D Gaussian mixture with 1 to 3 components is chosen by BIC. Adjacent
+    components that overlap (Ashman's D < ``min_d``) are merged, so a group that
+    the mixture happened to split counts once. Components holding less than
+    ``min_weight`` of the rows (a few outliers must not set the scale) or with
+    almost no spread (a spike, such as an imputed default value) are ignored.
+    If two or more well-separated groups remain, their pooled standard
+    deviation is returned."""
+    from sklearn.mixture import GaussianMixture
+    rng = np.random.default_rng(random_state)
+    x = v if len(v) <= max_n else rng.choice(v, max_n, replace=False)
+    x = x.reshape(-1, 1)
+    if len(np.unique(x)) < 10:
+        return None
+    best, best_bic = None, np.inf
+    for k in (1, 2, 3):
+        g = GaussianMixture(k, n_init=2, random_state=random_state).fit(x)
+        b = g.bic(x)
+        if b < best_bic:
+            best, best_bic = g, b
+    if best.n_components == 1:
+        return None
+    w = best.weights_.copy()
+    mu = best.means_[:, 0].copy()
+    var = best.covariances_.reshape(-1).copy()
+    comps = sorted(zip(mu, var, w))
+    merged = [list(comps[0])]
+    for m2, v2, w2 in comps[1:]:
+        m1, v1, w1 = merged[-1]
+        d = np.sqrt(2) * abs(m2 - m1) / np.sqrt(v1 + v2)
+        if d < min_d:                               # same group: moment-matched merge
+            wt = w1 + w2
+            m = (w1 * m1 + w2 * m2) / wt
+            v = (w1 * (v1 + (m1 - m) ** 2) + w2 * (v2 + (m2 - m) ** 2)) / wt
+            merged[-1] = [m, v, wt]
+        else:
+            merged.append([m2, v2, w2])
+    groups = [(m, v, wt) for m, v, wt in merged
+              if wt >= min_weight and np.sqrt(v) >= min_sd_frac * spread]
+    if len(groups) < 2:
+        return None
+    for (m1, v1, _), (m2, v2, _) in zip(groups, groups[1:]):
+        if np.sqrt(2) * abs(m2 - m1) / np.sqrt(v1 + v2) < min_d:
+            return None
+    wsum = sum(wt for _, _, wt in groups)
+    return float(np.sqrt(sum(wt * v for _, v, wt in groups) / wsum))
+
+
 def _gd_rank(X):
     """Number of components above the noise floor (Gavish & Donoho, 2014)."""
     n, d = X.shape
@@ -130,11 +184,16 @@ class Preprocessor:
         by the noise floor of the singular values.
     max_missing : float
         Columns with a larger share of missing values are dropped.
+    separate_modes : bool
+        With ``scale='robust'``, scale a column whose values form clearly
+        separated groups by the spread inside the groups rather than by its
+        interquartile range, which would span the gaps and squeeze the column.
     """
 
     def __init__(self, columns=None, exclude=None, scale='robust', max_dims=10,
-                 max_missing=0.5, random_state=0):
+                 max_missing=0.5, separate_modes=True, random_state=0):
         self.columns = columns
+        self.separate_modes = separate_modes
         self.exclude = exclude
         self.scale = scale
         self.max_dims = max_dims
@@ -217,6 +276,17 @@ class Preprocessor:
                 if spread <= 0:
                     spread = float(v.std())
                     notes.append('IQR 0 -> scaled by sd')
+                # A column whose values form separate groups has an interquartile
+                # range that spans the gap between them; scaling by it squeezes
+                # the column and can merge the subgroups along it. Such columns
+                # are scaled by the spread inside the groups instead (never by
+                # more than the IQR, so no column is down-weighted by this).
+                if self.separate_modes:
+                    inner = _within_mode_spread(v, spread, self.random_state)
+                    if inner is not None and inner < spread:
+                        notes.append(f'separate groups -> scaled by within-group '
+                                     f'spread ({inner:.3g} instead of {spread:.3g})')
+                        spread = inner
                 self.center_[c], self.spread_[c] = med, spread
             else:
                 self.center_[c], self.spread_[c] = 0.0, 1.0
@@ -282,6 +352,25 @@ def _median_sq_dist(Z, rng, m=4000):
     return float(np.median(d)) if len(d) else 1.0
 
 
+def _n_workers(n_jobs):
+    """Threads to use: n_jobs, or by default up to 8 (the sweep's fits are
+    small, and numpy already uses several cores inside each one)."""
+    if n_jobs is None:
+        return max(1, min(8, os.cpu_count() or 1))
+    return max(1, int(n_jobs))
+
+
+def _parallel_map(fn, items, n_jobs):
+    """map() over threads. Threads, not processes: the heavy work runs in numpy
+    and scipy with the GIL released, and processes would re-import the
+    caller's script (a problem in notebooks and unguarded scripts on macOS)."""
+    workers = _n_workers(n_jobs)
+    if workers == 1 or len(items) <= 1:
+        return [fn(x) for x in items]
+    with ThreadPoolExecutor(workers) as ex:
+        return list(ex.map(fn, items))
+
+
 def _agreement(a, b, min_rows=10):
     """Adjusted Rand index over the rows that both labelings put in a cluster.
     Rows labelled lone (-1) are left out, so declaring everything lone does not
@@ -294,8 +383,7 @@ def _agreement(a, b, min_rows=10):
 
 def select_gamma(Z, grid=None, n_seeds=4, sweep_size=2000, eval_size=3000,
                  min_share=0.01, min_size=10, max_lone=0.10, min_stability=0.8,
-                 link_tau=None,
-                 random_state=0):
+                 link_tau=None, random_state=0, n_jobs=None):
     """Choose the bandwidth from the data (thesis Sec. 5.2, automated).
 
     gamma is swept as c / s2, where s2 is the median squared distance between
@@ -344,23 +432,30 @@ def select_gamma(Z, grid=None, n_seeds=4, sweep_size=2000, eval_size=3000,
         grid = np.asarray(grid, float)
 
     min_rows = max(min_share * len(E), min_size)
+    def labels_at(task):
+        c, s = task
+        r = np.random.default_rng(random_state + 101 * (s + 1))
+        sub = r.choice(len(Z), sub_n, replace=False)
+        m = GACA(gamma_clustering=c / s2, sample_size=sub_n, random_state=s,
+                 link_tau=link_tau).fit(Z[sub])
+        lab = m._route(E)
+        # Rows in no Sun, in a genesis Lone Sun, or in a speck smaller than
+        # min_size all count as lone (-1).
+        lone = lab < 0
+        lone[~lone] = m.is_lone(lab[~lone])
+        lab = np.where(lone, -1, lab)
+        small = np.flatnonzero(np.bincount(lab[lab >= 0]) < min_size) if (lab >= 0).any() else []
+        lab[np.isin(lab, small)] = -1
+        return lab
+
+    # Every (grid value, subsample) fit is independent and seeded, so they run
+    # in parallel with results identical to a serial run.
+    tasks = [(c, s) for c in grid for s in range(n_seeds)]
+    all_labels = _parallel_map(labels_at, tasks, n_jobs)
+
     sweep = []
-    for c in grid:
-        labels = []
-        for s in range(n_seeds):
-            r = np.random.default_rng(random_state + 101 * (s + 1))
-            sub = r.choice(len(Z), sub_n, replace=False)
-            m = GACA(gamma_clustering=c / s2, sample_size=sub_n, random_state=s,
-                     link_tau=link_tau).fit(Z[sub])
-            lab = m._route(E)
-            # Rows in no Sun, in a genesis Lone Sun, or in a speck smaller than
-            # min_size all count as lone (-1).
-            lone = lab < 0
-            lone[~lone] = m.is_lone(lab[~lone])
-            lab = np.where(lone, -1, lab)
-            small = np.flatnonzero(np.bincount(lab[lab >= 0]) < min_size) if (lab >= 0).any() else []
-            lab[np.isin(lab, small)] = -1
-            labels.append(lab)
+    for gi, c in enumerate(grid):
+        labels = all_labels[gi * n_seeds:(gi + 1) * n_seeds]
         ks = []
         for lab in labels:
             ok = lab[lab >= 0]
@@ -448,6 +543,15 @@ class AutoGACA:
     hierarchy : bool
         With gamma='auto', also fit every other stable resolution the sweep
         found and nest them into a tree around the chosen one (default True).
+    n_jobs : int, optional
+        Threads for the bandwidth sweep and the hierarchy fits (default: up to
+        8). Results do not depend on it.
+    link_view : bool
+        Also cluster with saddle linking (link_tau=0.6, its own automatic
+        bandwidth) as an alternative view: better for curved or elongated
+        groups, worse when groups overlap. Stored in ``linked_labels_`` and shown
+        in the report when it disagrees with the main view (default True; only
+        with gamma='auto' and no link_tau).
     random_state : int
 
     Attributes after ``fit``
@@ -464,6 +568,9 @@ class AutoGACA:
         (path-style name per cluster, e.g. '0.2'), ``parent`` (index of each
         cluster's parent in the previous level) and ``chosen`` (the level of
         ``labels_``). A single level when no hierarchy was built.
+    linked_labels_ : cluster per row in the linked view (0 = largest, -1 =
+        anomaly), or None
+    link_agreement_ : adjusted Rand index between the main and linked views
     result_ : DataFrame with the per-row outputs, including one column per
         hierarchy level (needs pandas)
     """
@@ -471,7 +578,8 @@ class AutoGACA:
     def __init__(self, columns=None, exclude=None, scale='robust', max_dims=10,
                  gamma='auto', link_tau=None, sample_size=5000, kappa=1e-3,
                  min_cluster_size=10, bandwidth=None, hierarchy=True,
-                 random_state=0, verbose=False):
+                 random_state=0, n_jobs=None, link_view=True, separate_modes=True,
+                 verbose=False):
         self.columns = columns
         self.exclude = exclude
         self.scale = scale
@@ -484,6 +592,9 @@ class AutoGACA:
         self.bandwidth = bandwidth
         self.hierarchy = hierarchy
         self.random_state = random_state
+        self.n_jobs = n_jobs
+        self.link_view = link_view
+        self.separate_modes = separate_modes
         self.verbose = verbose
 
     def _log(self, msg):
@@ -494,7 +605,8 @@ class AutoGACA:
         df, names = _as_frame(data)
         self.n_rows_ = len(df)
         self.preprocessor_ = Preprocessor(self.columns, self.exclude, self.scale,
-                                          self.max_dims, random_state=self.random_state).fit(df)
+                                          self.max_dims, separate_modes=self.separate_modes,
+                                          random_state=self.random_state).fit(df)
         Z = self.preprocessor_.transform(df)
         self._log(f"{len(self.preprocessor_.used_)} columns used, GACA space "
                   f"{Z.shape[1]}-D")
@@ -506,7 +618,8 @@ class AutoGACA:
             self._log("Selecting gamma...")
             self.gamma_selection_ = select_gamma(Z, link_tau=self.link_tau,
                                                  min_size=self.min_cluster_size,
-                                                 random_state=self.random_state)
+                                                 random_state=self.random_state,
+                                                 n_jobs=self.n_jobs)
             gamma = self.gamma_selection_['gamma']
             self._log(f"  gamma = {gamma:.4g} (k = {self.gamma_selection_['k']}, "
                       f"stability {self.gamma_selection_['stability']:.2f})")
@@ -536,7 +649,29 @@ class AutoGACA:
         self._set_outputs(df, Z, raw)
         self._build_hierarchy(Z)
         self.clusters_ = self._describe(df)
+        self._fit_link_view(df)
         return self
+
+    def _fit_link_view(self, df):
+        """The alternative, linked clustering (see ``link_view``)."""
+        self.linked_ = None
+        self.linked_labels_ = None
+        self.link_agreement_ = None
+        if not (self.link_view and self.link_tau is None and self.bandwidth is None
+                and self.gamma == 'auto'):
+            return
+        self._log("Linked view...")
+        alt = AutoGACA(columns=self.columns, exclude=self.exclude, scale=self.scale,
+                       max_dims=self.max_dims, link_tau=0.6, sample_size=self.sample_size,
+                       kappa=self.kappa, min_cluster_size=self.min_cluster_size,
+                       hierarchy=False, link_view=False, separate_modes=self.separate_modes,
+                       random_state=self.random_state,
+                       n_jobs=self.n_jobs).fit(df)
+        self.linked_ = alt
+        self.linked_labels_ = alt.labels_
+        both = (self.labels_ >= 0) & (alt.labels_ >= 0)
+        self.link_agreement_ = (float(adjusted_rand_score(self.labels_[both], alt.labels_[both]))
+                                if both.sum() >= 10 else 0.0)
 
     # ------------------------------------------------------------- hierarchy
 
@@ -576,13 +711,17 @@ class AutoGACA:
                       key=lambda p: p['gamma'])
         core_chosen = np.array([self._cluster_of.get(int(r), -1)
                                 for r in self.model_.core_labels_])
+        # The level fits are independent: run them in parallel up front.
+        level_gammas = [p['gamma'] for p in coarse + fine]
+        models = dict(zip(level_gammas, _parallel_map(self._level_model, level_gammas,
+                                                      self.n_jobs)))
 
         # Coarser levels: merge the clusters of the level below.
         self._coarse_chain = []
         below_core, below_k = core_chosen, self.n_clusters_
         for p in coarse:
             self._log(f"  hierarchy: coarser level at gamma {p['gamma']:.3g}")
-            m = self._level_model(p['gamma'])
+            m = models[p['gamma']]
             reg = {int(sun): i for i, sun in enumerate(self._regular_suns(m))}
             member = np.array([reg.get(int(r), -1) for r in m.core_labels_])
             raw_parent = np.empty(below_k, dtype=int)
@@ -602,7 +741,7 @@ class AutoGACA:
         fine_labels = []
         for p in fine:
             self._log(f"  hierarchy: finer level at gamma {p['gamma']:.3g}")
-            m = self._level_model(p['gamma'])
+            m = models[p['gamma']]
             parent_of_sun = np.full(m.n_genesis_suns_, -1)
             for sun in self._regular_suns(m):
                 votes = above_core[(m.core_labels_ == sun) & (above_core >= 0)]
@@ -753,11 +892,25 @@ class AutoGACA:
         df, _ = _as_frame(data)
         Z = self.preprocessor_.transform(df)
         labels, groups = self._map(self.model_.assign(Z))
-        return self._frame(labels, groups, self._score(Z), self._hier_labels(Z, labels))
+        linked = None
+        if getattr(self, 'linked_', None) is not None:
+            linked = np.asarray(self.linked_.assign(df)['gaca_cluster']) \
+                if self._has_pandas() else self.linked_.assign(df)['gaca_cluster']
+        return self._frame(labels, groups, self._score(Z), self._hier_labels(Z, labels), linked)
 
-    def _frame(self, labels, groups, score, level_labels=None):
+    @staticmethod
+    def _has_pandas():
+        try:
+            import pandas  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    def _frame(self, labels, groups, score, level_labels=None, linked=None):
         cols = dict(gaca_cluster=labels, gaca_anomaly=labels < 0,
                     gaca_anomaly_group=groups, gaca_anomaly_score=np.round(score, 3))
+        if linked is not None:
+            cols['gaca_linked_cluster'] = linked
         levels = getattr(self, 'levels_', [])
         if level_labels is not None and len(levels) > 1:
             for i, (lv, lab) in enumerate(zip(levels, level_labels), start=1):
@@ -772,7 +925,7 @@ class AutoGACA:
     @property
     def result_(self):
         return self._frame(self.labels_, self.anomaly_group_, self.anomaly_score_,
-                           [lv['labels'] for lv in self.levels_])
+                           [lv['labels'] for lv in self.levels_], self.linked_labels_)
 
     def _describe(self, df):
         """Per cluster: size, medians of the original columns, and the columns
@@ -867,6 +1020,12 @@ class AutoGACA:
                          + (f"  [{d}]" if d else ''))
         if self.n_clusters_ > 10:
             lines.append(f"    ... {self.n_clusters_ - 10} more")
+        if self.linked_labels_ is not None:
+            k_link = self.linked_.n_clusters_
+            note = ("agrees with the main view" if self.link_agreement_ >= 0.8 else
+                    "differs from the main view: see the report")
+            lines.append(f"  linked view: {k_link} clusters, {note} "
+                         f"(agreement {self.link_agreement_:.2f})")
         if len(self.levels_) > 1:
             lines.append("  hierarchy: " + " -> ".join(
                 f"{lv['k']}{'*' if lv['chosen'] else ''}" for lv in self.levels_)

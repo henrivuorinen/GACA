@@ -168,3 +168,44 @@ def test_no_hierarchy_when_disabled_or_gamma_given():
     X, _ = _two_level_data()
     assert len(AutoGACA(scale='none', hierarchy=False).fit(X).levels_) == 1
     assert len(AutoGACA(scale='none', bandwidth=0.5).fit(X).levels_) == 1
+
+
+def test_link_view_recovers_moons_and_is_reported():
+    pd = pytest.importorskip("pandas")
+    X, y = make_moons(2000, noise=0.06, random_state=0)
+    auto = AutoGACA().fit(X)
+    assert adjusted_rand_score(y, auto.linked_labels_) > 0.95
+    assert auto.link_agreement_ < 0.8                      # differs: report shows it
+    assert 'gaca_linked_cluster' in auto.result_.columns
+
+
+def test_link_view_off_and_not_with_given_gamma():
+    X, _ = _blobs_with_anomalies()
+    assert AutoGACA(link_view=False).fit(X).linked_labels_ is None
+    assert AutoGACA(bandwidth=2.0).fit(X).linked_labels_ is None
+
+
+def test_parallel_and_serial_runs_agree():
+    X, _ = _blobs_with_anomalies()
+    a = AutoGACA(n_jobs=1, link_view=False).fit(X)
+    b = AutoGACA(n_jobs=4, link_view=False).fit(X)
+    assert np.array_equal(a.labels_, b.labels_)
+    assert np.allclose(a.anomaly_score_, b.anomaly_score_)
+
+
+def test_columns_with_separate_groups_keep_their_subgroups():
+    centers = [[0, 0], [1.6, 0], [0.8, 1.4], [12, 0], [13.6, 0], [12.8, 1.4]]
+    X, y = make_blobs(4000, centers=centers, cluster_std=0.3, random_state=0)
+    auto = AutoGACA(link_view=False).fit(X)              # default robust scaling
+    assert 'within-group' in auto.preprocessor_.decisions_['x0']
+    assert max(adjusted_rand_score(y, lv['labels']) for lv in auto.levels_) > 0.9
+
+
+def test_outliers_and_spikes_do_not_trigger_group_scaling():
+    rng = np.random.default_rng(0)
+    v = rng.normal(0, 1, 3000)
+    with_outliers = np.r_[v, np.full(30, 40.0) + rng.normal(0, 0.1, 30)]   # 1% far away
+    with_spike = np.r_[v, np.full(900, 5.0)]                                # imputed constant
+    from gaca.auto import _within_mode_spread
+    assert _within_mode_spread(with_outliers, 1.0) is None
+    assert _within_mode_spread(with_spike, 1.0) is None

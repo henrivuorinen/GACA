@@ -95,7 +95,7 @@ def _sweep_svg(sel, width=960, height=260):
     return "".join(out)
 
 
-def _scatter_svg(auto, size=520, max_points=4000):
+def _scatter_svg(auto, size=520, max_points=4000, labels=None):
     Z = auto.Z_
     if Z.shape[1] >= 2:
         Zc = Z - Z.mean(0)
@@ -120,8 +120,11 @@ def _scatter_svg(auto, size=520, max_points=4000):
     sc = lambda p: pad + (p - lo) / span * (size - 2 * pad)
     out = [f'<svg viewBox="0 0 {size} {size}" width="100%" style="max-width:{size}px" role="img" '
            f'aria-label="Rows projected on the two main axes of the clustering space">']
+    labels = auto.labels_ if labels is None else labels
     for i in normal:
-        lab = auto.labels_[i]
+        lab = labels[i]
+        if lab < 0:
+            continue
         col = PALETTE[lab] if lab < len(PALETTE) else OTHER
         px, py = sc(P[i])
         out.append(f'<circle cx="{px:.1f}" cy="{size - py:.1f}" r="1.8" fill="{col}" fill-opacity="0.7"/>')
@@ -163,6 +166,40 @@ def _anomaly_rows(auto, data, top=25):
         rows.append(f"<tr><td>{i}</td><td>{auto.anomaly_score_[i]:.2f}</td>"
                     f"<td>{auto.anomaly_group_[i]}</td><td>{cells}</td></tr>")
     return f'<div class="scroll"><table>{head}{"".join(rows)}</table></div>'
+
+
+def _link_view_html(auto):
+    """The linked clustering, shown when it disagrees with the main view."""
+    main, link = auto.labels_, auto.linked_labels_
+    k = auto.linked_.n_clusters_
+    head = ("<h2>Alternative view: linked clusters</h2>"
+            "<p class='note'>A second clustering joins groups connected by a dense "
+            f"bridge, and here it gives {k} clusters that differ from the main view "
+            f"(agreement {auto.link_agreement_:.2f}, where 1 is identical). Neither is "
+            "right in general. The linked view is usually better when groups are "
+            "<b>curved or elongated</b> (filaments, arcs, rings), because the main view "
+            "cuts them into pieces. The main view is usually better when groups "
+            "<b>overlap</b>, because linking merges them. Knowing which shape your "
+            "groups have decides it. The linked labels are in <code>labels.csv</code> as "
+            "<code>gaca_linked_cluster</code>.</p>")
+    rows = []
+    for c in range(k):
+        mask = link == c
+        if not mask.any():
+            continue
+        parts = np.bincount(main[mask & (main >= 0)], minlength=auto.n_clusters_)
+        shares = parts / max(parts.sum(), 1)
+        made = ", ".join(f"{j} ({100 * shares[j]:.0f}%)" for j in np.argsort(-parts)
+                         if shares[j] >= 0.05)
+        col = PALETTE[c] if c < len(PALETTE) else OTHER
+        rows.append(f"<tr><td><span class='swatch' style='background:{col}'></span>{c}</td>"
+                    f"<td>{mask.sum():,}</td><td>{100 * mask.mean():.1f}%</td>"
+                    f"<td>{made or '–'}</td></tr>")
+    table = ("<div class='scroll'><table><tr><th>Linked cluster</th><th>Rows</th><th>Share</th>"
+             "<th>Main-view clusters it contains (share of its rows)</th></tr>"
+             + "".join(rows) + "</table></div>")
+    return (head + table + "<p class='muted' style='margin-top:16px'>The same map as above, "
+            "coloured by the linked view:</p>" + _scatter_svg(auto, labels=link))
 
 
 def _tree_html(auto):
@@ -246,6 +283,9 @@ def write_report(auto, path, data=None, title=None):
                  "appear to overlap). Colours are clusters; red crosses are anomalies.</p>")
     parts.append(_scatter_svg(auto))
 
+    if getattr(auto, 'linked_labels_', None) is not None and auto.link_agreement_ < 0.8:
+        parts.append(_link_view_html(auto))
+
     parts.append("<h2>Anomalies</h2><p class='muted'>Rows that no cluster pulls: they would not "
                  "have moved in the simulation. Rows in the same group are near-copies of each "
                  "other. The score is −log<sub>10</sub> of the pull on the row relative to a "
@@ -277,7 +317,9 @@ def write_report(auto, path, data=None, title=None):
                 ("γ", f"{auto.gamma_:.4g}" + (" (automatic)" if sel is not None else
                        f" (from bandwidth {auto.bandwidth:g})" if auto.bandwidth else " (given)")),
                 ("ε", f"{auto.model_.epsilon_:.3g}"), ("coreset", f"{len(auto.model_.core_):,} rows"),
-                ("saddle linking", f"τ = {auto.link_tau}" if auto.link_tau else "off"),
+                ("saddle linking", f"τ = {auto.link_tau}" if auto.link_tau else
+                 ("off (shown as the alternative view)" if getattr(auto, 'linked_labels_', None)
+                  is not None else "off")),
                 ("random seed", auto.random_state)]
     parts.append("<table style='margin-top:16px'>" + "".join(
         f"<tr><th>{_e(a)}</th><td>{_e(b)}</td></tr>" for a, b in settings) + "</table>")
