@@ -25,7 +25,11 @@ experiments = [
     "psutil>=5.9",
     "pyarrow>=14",
 ]
-dev = ["pytest>=7"]
+cli = ["pandas>=2.0"]
+dev = ["pytest>=7", "pandas>=2.0"]
+
+[project.scripts]
+gaca = "gaca.cli:main"
 
 [tool.setuptools]
 packages = ["gaca"]

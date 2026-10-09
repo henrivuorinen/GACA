@@ -288,7 +288,7 @@ def assign(X, suns, masses):
 
 
 def saddle_link(Z, members, w, gamma, tau=0.5, kappa=0.0, n_neighbors=10,
-                pull=None):
+                pull=None, protect=None):
     """Join Suns whose coreset members are connected by a high-density bridge.
 
     The flat output of Solar Genesis can only express Voronoi-like cells, and a
@@ -303,7 +303,9 @@ def saddle_link(Z, members, w, gamma, tau=0.5, kappa=0.0, n_neighbors=10,
     two groups are joined when the bridge reaches ``tau`` times the lower of
     their two peak densities (a persistence ratio, as in ToMATo) and is at least
     ``kappa``. Lone Suns, whose external pull is below ``kappa``, are never
-    joined.
+    joined, and neither are Suns flagged in ``protect`` (a boolean array over
+    Suns): a small group has a low peak, so almost any bridge would pass the
+    ratio test and absorb it.
 
     Returns the new label of each original Sun (an array of length
     ``members.max() + 1``) and the external pull at every member.
@@ -319,6 +321,8 @@ def saddle_link(Z, members, w, gamma, tau=0.5, kappa=0.0, n_neighbors=10,
     i = np.repeat(np.arange(len(Z)), k - 1)
     j = nb[:, 1:].ravel()
     keep = (members[i] != members[j]) & (i < j)
+    if protect is not None:
+        keep &= ~protect[members[i]] & ~protect[members[j]]
     i, j = i[keep], j[keep]
     bridge = np.minimum(pull[i], pull[j])
     for t in (0.25, 0.5, 0.75):

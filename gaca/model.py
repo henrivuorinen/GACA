@@ -39,7 +39,7 @@ class GACA(BaseEstimator):
     """
 
     def __init__(self, gamma_clustering=1.0, n_iterations=20,
-                 theta=0.5, epsilon=0.05, sample_size=5000,
+                 theta=0.5, epsilon='auto', sample_size=5000,
                  task_type='regression', random_state=None, eta=0.5,
                  min_expert_size=10, verbose=False, method='exact',
                  assignment='pull', kappa=1e-3, link_tau=None, n_neighbors=32,
@@ -47,6 +47,11 @@ class GACA(BaseEstimator):
         self.gamma_clustering = gamma_clustering
         self.n_iterations = n_iterations
         self.theta = theta
+        # Condensation radius. 'auto' scales the thesis value with the kernel
+        # width, 0.05 / sqrt(gamma), but caps it at half the median
+        # nearest-neighbour distance in the coreset: a radius larger than the
+        # point spacing chains whole dense structures together in the first
+        # iteration. On the thesis data (gamma = 1, 5-D) this is 0.05.
         self.epsilon = epsilon
         self.sample_size = sample_size
         self.task_type = task_type
@@ -92,6 +97,16 @@ class GACA(BaseEstimator):
 
         self._log(f"Fitting GACA: running Solar Genesis on {len(X_core)} points...")
 
+        if isinstance(self.epsilon, str):
+            if self.epsilon != 'auto':
+                raise ValueError(f"epsilon must be a number or 'auto', got {self.epsilon!r}")
+            nn = cKDTree(X_core).query(X_core, k=2)[0][:, 1] if len(X_core) > 1 else np.zeros(1)
+            nn = nn[nn > 0]
+            spacing = float(np.median(nn)) if len(nn) else np.inf
+            self.epsilon_ = min(0.05 / np.sqrt(self.gamma_clustering), 0.5 * spacing)
+        else:
+            self.epsilon_ = float(self.epsilon)
+
         # 2. Solar Genesis: the Suns, their accumulated masses, and the Sun each
         #    coreset row condensed into
         self.suns_, self.sun_masses_, self.n_iters_, members = solar_genesis(
@@ -99,7 +114,7 @@ class GACA(BaseEstimator):
             gamma=self.gamma_clustering,
             n_iterations=self.n_iterations,
             theta=self.theta,
-            epsilon=self.epsilon,
+            epsilon=self.epsilon_,
             eta=self.eta,
             method=self.method,
             return_iters=True,
@@ -119,9 +134,10 @@ class GACA(BaseEstimator):
             self.kappa_ = self.kappa * float(np.median(pull))
 
             if self.link_tau is not None and len(self.suns_) > 1:
+                limit = max(1.0, self.lone_share * self.sun_masses_.sum())
                 new_label, _ = saddle_link(X_core, members, w, self.gamma_clustering,
                                            tau=self.link_tau, kappa=self.kappa_,
-                                           pull=pull)
+                                           pull=pull, protect=self.sun_masses_ <= limit)
                 M = np.bincount(new_label, weights=self.sun_masses_)
                 self.suns_ = np.column_stack([
                     np.bincount(new_label, weights=self.sun_masses_ * self.suns_[:, j])

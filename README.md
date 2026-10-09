@@ -70,13 +70,95 @@ Suns are never joined.
 git clone https://github.com/<your-user>/GACA.git
 cd GACA
 pip install -e .                  # core: numpy, scipy, scikit-learn
+pip install -e ".[cli]"           # + pandas, for CSV files and the gaca command
 pip install -e ".[experiments]"   # + pandas, matplotlib, hdbscan, lightgbm, ...
 pip install -e ".[dev]"           # + pytest
 ```
 
 Python 3.9 or newer.
 
-## Quickstart
+## Any table: AutoGACA and the `gaca` command
+
+The algorithm only needs points in a space, but someone has to decide how to
+turn a table into that space and which bandwidth to use. `AutoGACA` makes those
+decisions from the data and records each one, so a dataset can be clustered
+without knowing anything about it in advance:
+
+```bash
+gaca run galaxies.csv                         # writes galaxies_gaca/
+gaca run galaxies.csv --exclude objid,ra,dec  # leave columns out
+gaca run huge.csv --chunksize 200000          # files larger than memory
+```
+
+The output folder holds `labels.csv` (the input rows plus `gaca_cluster`,
+`gaca_anomaly`, `gaca_anomaly_group` and `gaca_anomaly_score`), a self-contained
+`report.html` and `summary.json`. The report describes each cluster in terms of
+the original columns, lists the anomalies and the columns that make them
+unusual, shows how the resolution was chosen and which other resolutions were
+also stable, and lists every preprocessing decision.
+
+From Python:
+
+```python
+from gaca import AutoGACA
+
+auto = AutoGACA().fit(df)           # DataFrame, array, or path to a CSV
+print(auto.summary())
+auto.result_                        # per-row cluster, anomaly flag, group, score
+auto.report("report.html", data=df)
+new = auto.assign(df_new)           # same preprocessing, same clusters
+```
+
+What it decides, and how:
+
+| Step | Rule |
+|---|---|
+| Columns | Numeric columns are used. Text, identifiers (unique integers named like `id` or strictly increasing), constant columns and columns more than 50% missing are left out. `columns=` / `exclude=` override. |
+| Missing values | Median of the column. |
+| Transforms | `log1p` for count- or flux-like columns: non-negative, skewed, and spanning more than an order of magnitude. Other skewed columns are left alone, since a log would also pull genuine outliers back towards the data. |
+| Scaling | Median and interquartile range, so outliers do not compress everything else. `scale='none'` (`--scale none`) keeps the values as they are, for data whose distances already mean something, such as positions in physical units. |
+| Dimensions | Unchanged up to `max_dims` columns (default 10). Above that, PCA to between 5 and `max_dims` components, the number set by the noise floor of the singular values (Gavish and Donoho). |
+| γ | Swept as c / (median squared distance between rows). At each value GACA is fitted on four subsamples. γ is the middle of the most stable stretch of the longest plateau in the cluster count. A split only counts if the subsamples agree (adjusted Rand index ≥ 0.8). Otherwise the answer is one group. |
+| Anomalies | Rows that no cluster pulls, plus clusters smaller than `min_cluster_size` (10 rows). Score = −log10 of the pull relative to a typical row; above 3 is anomalous. |
+
+How it did on data it was not tuned on (ARI against known labels; *best γ* is
+the best that any γ in the sweep achieved):
+
+| Data | Rows × columns | AutoGACA | Best γ | Notes |
+|---|---|---|---|---|
+| Wine | 178 × 13 | 0.79 | 0.82 | 3 clusters, PCA to 5-D |
+| Iris | 150 × 4 | 0.54 | 0.55 | two of the species overlap; density methods see 2 groups |
+| Breast cancer | 569 × 30 | 0.36 | 0.50 | |
+| Blobs + planted anomalies | 20,042 × 5 | 0.99 | 0.99 | 42/42 anomalies, 0.1% false positives |
+| 6 clusters in 30-D, 25 columns of noise | 6,000 × 30 | 0.90 | 0.89 | PCA to 5-D |
+| Two moons, `link_tau=0.6` | 4,000 × 2 | 1.00 | | |
+| Concentric circles, `link_tau=0.6` | 4,000 × 2 | 0.93 | | |
+| Handwritten digits | 1,797 × 64 | 0.17 | 0.24 | not density-separated in a few dimensions |
+| One Gaussian (no clusters) | 5,000 × 2 to 10 | 1 cluster | | correctly reports no structure and no anomalies |
+
+`link_tau` is not on by default: it joins curved clusters but also merges
+clusters that overlap (the 30-D case drops to 0.15 with it).
+
+To try it on real astronomy data, `examples/sdss/` downloads two public Sloan
+Digital Sky Survey tables (object properties, and galaxy positions around the
+Coma cluster) and walks through both runs; see
+[examples/sdss/README.md](examples/sdss/README.md).
+
+### Why `max_dims` can be 10 or more
+
+The thesis put the ceiling at about 15 dimensions, for two reasons: the
+Barnes-Hut tree degrades, and the Gaussian kernel loses contrast. The first is
+gone with the exact backend. The second was made worse in the thesis experiment
+by keeping γ = 1 at every dimension: in 45-D, squared distances are around 90,
+every pull is about e⁻⁹⁰, and every point becomes a singleton. With γ scaled to
+the data, six clusters were recovered at ARI ≥ 0.98 from 10 to 50 dimensions
+when every column carries signal. When most columns are noise the limit is
+real: raw data held up to about 15 dimensions (ARI 0.86), fell to 0.17 at 30,
+and PCA restored it (0.89 at 5 components). Hence the default: use the columns
+as they are up to 10, and project above that. Raise `max_dims` when you know the
+columns are informative.
+
+## Using the algorithm directly
 
 ```python
 import numpy as np
@@ -132,7 +214,7 @@ y_pred = model.predict(X_test)
 | Parameter | Default | Meaning |
 |---|---|---|
 | `gamma_clustering` | 1.0 | Gaussian bandwidth γ. The main dial: low γ merges everything into one Sun, high γ fragments into many |
-| `epsilon` | 0.05 | Condensation radius ε. Has little effect on structure; larger is faster |
+| `epsilon` | `'auto'` | Condensation radius ε. `'auto'` = 0.05/√γ, capped at half the coreset's median nearest-neighbour distance (= 0.05 on the thesis data); a radius larger than the point spacing chains dense structures together |
 | `eta` | 0.5 | Damping η of the transport step |
 | `sample_size` | 5000 | Coreset size for Solar Genesis |
 | `n_iterations` | 20 | Iteration cap for genesis |
@@ -155,19 +237,20 @@ masses), `kernel_pull`, `saddle_link`, `GACANode` and
 
 ## Practical guidance
 
-- **Standardise your features.** γ and ε are defined on a standardised scale.
-- **Keep dimensionality low.** The Barnes-Hut tree stops helping above roughly
-  15 dimensions, and clustering quality collapses with it. Project to about 5
-  dimensions with PCA first. In the thesis, 45 raw dimensions took over an hour
-  and shattered into 1,377 singletons; PCA to 5 dimensions took 33 seconds.
+These apply to `GACA` used directly; `AutoGACA` handles the first three.
+
+- **Scale your features.** γ is defined relative to the scale of the space.
+- **Mind the dimension.** See [above](#why-max_dims-can-be-10-or-more): with γ
+  scaled to the data, 10 or more informative columns work. Many noise columns
+  need PCA first.
 - **Choose γ from the plateau.** Sweep γ and pick a value where the Sun count is
-  stable. γ = 1.0 sat in the stable band on the thesis data.
+  stable (`select_gamma` does this). γ = 1.0 sat in the stable band on the
+  thesis data.
 - **Genesis is cheap now.** With the exact backend, genesis takes about 0.6 s on
   a 5,000-point coreset and 28 s on 40,000 (the thesis reports 22.5 s and 370 s).
-- **Non-convex clusters: raise γ and link.** For crescents, rings or elongated
-  groups, use a finer bandwidth (γ ≈ 10 worked best) with `link_tau=0.6`. At
-  γ = 1 linking is unnecessary and can join adjacent groups; at γ = 30 the
-  coreset is too sparse for the bridge estimates and linking under-merges.
+- **Non-convex clusters: link.** For crescents, rings or elongated groups, use
+  `link_tau=0.6`. Linking joins clusters connected by a dense bridge, so it also
+  joins clusters that overlap; leave it off when groups touch.
 - **Anomaly sensitivity.** `kappa` sets how little pull makes a row a Lone Sun.
   Raising γ also makes more rows lone, since the kernel narrows; at very high γ
   a small coreset cannot cover sparse tails and genuine rows start to be
@@ -204,7 +287,7 @@ Experts on a fresh test set with new anomalies.
 | company-like | thesis (`M/d²`) | 0.22 | 0.01% | 0.080 | 0.397 |
 | company-like | thesis + OOD95 rule | 1.00 | 4.89% | 0.080 | 0.395 |
 | company-like | **pull (new default)** | **1.00** | 0.35% | 0.173 | **0.579** |
-| company-like | pull, γ = 5, `link_tau=0.6` | 1.00 | 2.82% | 0.579 | 0.712 |
+| company-like | pull, γ = 5, `link_tau=0.6` | 1.00 | 5.76% | 0.604 | 0.738 |
 
 What changed and why:
 
@@ -241,9 +324,12 @@ numbers should be re-run before the new defaults are trusted on that data.
 ## Repository layout
 
 ```
-gaca/            the package: Solar Genesis, assignment, GACA estimator
-tests/           pytest suite (mass conservation, Lone Suns, estimator)
-examples/        runnable demo on synthetic data
+gaca/            the package: Solar Genesis and assignment (genesis.py), the
+                 GACA estimator (model.py), AutoGACA (auto.py), the HTML report
+                 (report.py) and the gaca command (cli.py)
+tests/           pytest suite (mass conservation, Lone Suns, estimator, AutoGACA, CLI)
+examples/        runnable demo on synthetic data; sdss/ fetches public SDSS
+                 data and shows AutoGACA on it
 experiments/     the scripts behind every thesis table and figure, plus
                  improvements_benchmark.py (thesis vs current defaults)
 figures/         images used in this README
