@@ -1,34 +1,61 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "gaca"
-version = "1.0.0"
-description = "Gravitational Accretion Clustering Algorithm: scalable, physics-inspired density clustering"
+dynamic = ["version"]
+description = "Gravitational Accretion Clustering: physics-inspired clustering and anomaly detection for large tables"
 readme = "README.md"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Henri J. Vuorinen" }]
-requires-python = ">=3.9"
+requires-python = ">=3.10"
+keywords = ["clustering", "anomaly detection", "outlier detection", "mean shift",
+            "density clustering", "unsupervised learning", "streaming"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Astronomy",
+]
 dependencies = [
     "numpy>=1.24",
     "scipy>=1.10",
     "scikit-learn>=1.3",
+    "pandas>=2.0",
 ]
 
 [project.optional-dependencies]
+# Kept for older install instructions; pandas is now a core dependency.
+cli = []
 experiments = [
-    "pandas>=2.0",
     "matplotlib>=3.7",
     "hdbscan>=0.8",
     "lightgbm>=4.0",
     "psutil>=5.9",
     "pyarrow>=14",
 ]
-dev = ["pytest>=7"]
+dev = ["pytest>=7", "build", "twine"]
+
+[project.urls]
+Homepage = "https://github.com/henrivuorinen/GACA"
+Repository = "https://github.com/henrivuorinen/GACA"
+Issues = "https://github.com/henrivuorinen/GACA/issues"
+Changelog = "https://github.com/henrivuorinen/GACA/blob/main/CHANGELOG.md"
+
+[project.scripts]
+gaca = "gaca.cli:main"
 
 [tool.setuptools]
 packages = ["gaca"]
+
+[tool.setuptools.dynamic]
+version = { attr = "gaca.__version__" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

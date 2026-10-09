@@ -99,7 +99,7 @@ def run_real_data_test(csv_path):
     # Initialize the GACA
     # gamma: try 1.0 first, adjust if you get too many/few clusters
     # epsilon: merge radius in scaled space (0.1 is usually a good start)
-    gaca = GACA(
+    gaca = GACA(assignment='newton', method='barnes_hut',
         gamma_clustering=0.8,
         n_iterations=30,
         theta=0.7,

@@ -54,7 +54,7 @@ def run_clustering_benchmark(X, sample_name="Company Sample"):
 
     # --- 1. RUN GACA (Physics-Based Model) ---
     print("\n--- Running GACA (Barnes-Hut) ---")
-    gaca = GACA(gamma_clustering=GAMMA, n_iterations=N_ITER,
+    gaca = GACA(assignment='newton', method='barnes_hut', gamma_clustering=GAMMA, n_iterations=N_ITER,
                                epsilon=EPSILON, sample_size=CORESET,
                                random_state=RANDOM_SEED, eta=ETA)
     start = time.time()

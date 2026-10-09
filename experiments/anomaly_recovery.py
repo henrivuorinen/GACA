@@ -146,7 +146,7 @@ def run_seed(seed, Xs_real, coresets):
         t0 = time.perf_counter()
         with contextlib.redirect_stdout(open(os.devnull, 'w')):
             suns, masses = solar_genesis(
-                X[core_idx], gamma=GAMMA, n_iterations=N_ITER,
+                X[core_idx], method='barnes_hut', gamma=GAMMA, n_iterations=N_ITER,
                 theta=THETA, epsilon=EPSILON, eta=ETA)
             labels = assign(X, suns, masses)
         genesis_s = time.perf_counter() - t0

@@ -1,0 +1,38 @@
+# Builds the package and uploads it to PyPI when a GitHub release is published.
+# Uses PyPI trusted publishing: no API token is stored. One-time setup on
+# pypi.org: add this repository and the workflow file "publish.yml" with
+# environment "pypi" as a trusted publisher for the project "gaca".
+name: publish
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build twine
+      - run: python -m build
+      - run: twine check --strict dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write          # lets PyPI verify the upload comes from this repo
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

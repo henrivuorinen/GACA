@@ -159,7 +159,7 @@ def tree_visit_fraction(Xc, n_q=500, rng=None):
 
 
 def cluster_metrics(X):
-    gaca = GACA(gamma_clustering=GAMMA, n_iterations=N_ITER, epsilon=EPS,
+    gaca = GACA(assignment='newton', method='barnes_hut', gamma_clustering=GAMMA, n_iterations=N_ITER, epsilon=EPS,
                                theta=THETA, sample_size=CORESET, eta=ETA,
                                random_state=RANDOM_SEED)
     t = time.time()

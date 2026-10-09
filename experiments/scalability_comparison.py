@@ -91,7 +91,7 @@ def gaca_time(X):
     core = X[rng.choice(len(X), min(CORESET, len(X)), replace=False)]
     t = time.time()
     with contextlib.redirect_stdout(open(os.devnull, 'w')):
-        suns, masses = solar_genesis(core, gamma=GAMMA, n_iterations=N_ITER,
+        suns, masses = solar_genesis(core, method='barnes_hut', gamma=GAMMA, n_iterations=N_ITER,
                                           theta=THETA, epsilon=EPS, eta=ETA)
         assign(X, suns, masses)
     return time.time() - t, len(suns)
