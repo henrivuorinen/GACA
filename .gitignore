@@ -22,3 +22,7 @@ data/*
 *.png
 tables.tex
 !figures/*.png
+
+# Packaging output
+dist/
+build/

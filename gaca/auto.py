@@ -20,6 +20,7 @@ readable output:
 import re
 
 import numpy as np
+from scipy.spatial import cKDTree
 from sklearn.decomposition import PCA
 from sklearn.metrics import adjusted_rand_score
 
@@ -90,6 +91,11 @@ def _float_or_nan(x):
 def _skew(v):
     s = v.std()
     return 0.0 if s == 0 else float(np.mean(((v - v.mean()) / s) ** 3))
+
+
+def _path_key(name):
+    """Sort key for path-style cluster names: '0.2' before '0.10'."""
+    return tuple(int(p) for p in name.split('.'))
 
 
 def _gd_rank(X):
@@ -293,7 +299,8 @@ def select_gamma(Z, grid=None, n_seeds=4, sweep_size=2000, eval_size=3000,
     """Choose the bandwidth from the data (thesis Sec. 5.2, automated).
 
     gamma is swept as c / s2, where s2 is the median squared distance between
-    rows, so the grid ``c`` is dimensionless. At each value GACA is fitted on
+    rows, so the grid ``c`` is dimensionless. It runs from c = 2 to whichever
+    is finer: c = 160, or a kernel three nearest-neighbour distances wide. At each value GACA is fitted on
     ``n_seeds`` random subsamples and the labels of a common evaluation sample
     are compared:
 
@@ -307,18 +314,34 @@ def select_gamma(Z, grid=None, n_seeds=4, sweep_size=2000, eval_size=3000,
     ``min_stability``. Without that bar, featureless data (one Gaussian) yields
     a "best" split that is just noise: its stability stays around 0.6 to 0.75,
     while real structure in the tests scored 0.89 or more. Other plateaus are returned as
-    alternative resolutions.
+    alternative resolutions, and ``plateaus`` lists every plateau (at most six),
+    coarse to fine, for the cluster hierarchy.
 
     Returns a dict with ``gamma``, ``c``, ``k``, ``stability``, the full
     ``sweep`` table and ``alternatives``. If no plateau with k >= 2 exists, the
     data has no stable multi-cluster structure at any tested resolution;
     ``found`` is then False and the most stable value overall is returned.
     """
-    grid = np.geomspace(2, 160, 14) if grid is None else np.asarray(grid, float)
     rng = np.random.default_rng(random_state)
     s2 = _median_sq_dist(Z, rng)
     E = Z if len(Z) <= eval_size else Z[rng.choice(len(Z), eval_size, replace=False)]
     sub_n = min(sweep_size, max(int(0.8 * len(Z)), 2))
+    if grid is None:
+        # The coarse end is set by the typical distance between rows. The fine
+        # end must reach the local scale too: in multi-scale data (groups made
+        # of subgroups) the typical distance is set by the largest gaps, and a
+        # grid that stops at c = 160 never resolves the subgroups. So it runs
+        # until the kernel is about three nearest-neighbour distances wide, in
+        # steps of about 1.37x.
+        nn = cKDTree(E).query(E, k=2)[0][:, 1]
+        nn = nn[nn > 0]
+        hi = 160.0
+        if len(nn):
+            hi = max(hi, s2 / (2.0 * (3.0 * float(np.median(nn))) ** 2))
+        n_grid = int(np.clip(round(np.log(hi / 2.0) / np.log(1.37)) + 1, 14, 24))
+        grid = np.geomspace(2.0, hi, n_grid)
+    else:
+        grid = np.asarray(grid, float)
 
     min_rows = max(min_share * len(E), min_size)
     sweep = []
@@ -369,23 +392,31 @@ def select_gamma(Z, grid=None, n_seeds=4, sweep_size=2000, eval_size=3000,
         return near[len(near) // 2]
 
     if runs:
-        runs.sort(key=lambda run: (len(run), np.mean([sweep[i]['stability'] for i in run])),
-                  reverse=True)
+        # Longest plateau first; then the clearly more stable one (in steps of
+        # 0.02); then, among plateaus that are equally long and equally stable,
+        # the finer one. Such ties are common on a discrete grid, and the
+        # hierarchy keeps the coarser resolutions anyway.
+        def run_key(run):
+            stab = np.mean([sweep[i]['stability'] for i in run])
+            return len(run), int(round(stab / 0.02)), run[0]
+        runs.sort(key=run_key, reverse=True)
         pick = best_of(runs[0])
         alts = [best_of(run) for run in runs[1:4]]
+        plateaus = sorted(best_of(run) for run in runs[:6])   # by gamma, coarse to fine
         found = True
     else:
         # No stable multi-cluster structure: report the most stable resolution
         # that does not declare most rows lone (typically one cluster).
         ok = [i for i, r in enumerate(sweep) if r['lone_share'] <= max_lone] or [0]
         pick = max(ok, key=lambda i: (round(sweep[i]['stability'], 3), -i))
-        alts, found = [], False
+        alts, plateaus, found = [], [pick], False
 
     for i, r in enumerate(sweep):
         r['chosen'] = i == pick
     out = dict(sweep[pick])
     out.update(found=found, median_sq_dist=s2, sweep=sweep,
-               alternatives=[dict(sweep[i]) for i in alts])
+               alternatives=[dict(sweep[i]) for i in alts],
+               plateaus=[dict(sweep[i]) for i in plateaus])
     return out
 
 
@@ -414,6 +445,9 @@ class AutoGACA:
     min_cluster_size : int
         Clusters with fewer rows are reported as anomaly groups (rare, isolated
         groups) rather than clusters.
+    hierarchy : bool
+        With gamma='auto', also fit every other stable resolution the sweep
+        found and nest them into a tree around the chosen one (default True).
     random_state : int
 
     Attributes after ``fit``
@@ -425,12 +459,18 @@ class AutoGACA:
         rows above 3 (with the default kappa) are anomalies
     clusters_ : list of dicts describing each cluster
     gamma_selection_ : output of :func:`select_gamma` (if gamma='auto')
-    result_ : DataFrame with the four per-row outputs (needs pandas)
+    levels_ : the cluster hierarchy, coarse to fine; one dict per level with
+        ``gamma``, ``k``, ``labels`` (cluster per row, -1 = anomaly), ``names``
+        (path-style name per cluster, e.g. '0.2'), ``parent`` (index of each
+        cluster's parent in the previous level) and ``chosen`` (the level of
+        ``labels_``). A single level when no hierarchy was built.
+    result_ : DataFrame with the per-row outputs, including one column per
+        hierarchy level (needs pandas)
     """
 
     def __init__(self, columns=None, exclude=None, scale='robust', max_dims=10,
                  gamma='auto', link_tau=None, sample_size=5000, kappa=1e-3,
-                 min_cluster_size=10, bandwidth=None,
+                 min_cluster_size=10, bandwidth=None, hierarchy=True,
                  random_state=0, verbose=False):
         self.columns = columns
         self.exclude = exclude
@@ -442,6 +482,7 @@ class AutoGACA:
         self.kappa = kappa
         self.min_cluster_size = min_cluster_size
         self.bandwidth = bandwidth
+        self.hierarchy = hierarchy
         self.random_state = random_state
         self.verbose = verbose
 
@@ -489,9 +530,177 @@ class AutoGACA:
         self._group_of = {}
         self.n_clusters_ = len(regular)
 
+        regular_members = np.isin(self.model_.core_labels_, regular)
+        self._regular_tree = (cKDTree(self.model_.core_[regular_members])
+                              if regular_members.any() else None)
         self._set_outputs(df, Z, raw)
+        self._build_hierarchy(Z)
         self.clusters_ = self._describe(df)
         return self
+
+    # ------------------------------------------------------------- hierarchy
+
+    def _level_model(self, gamma):
+        """A GACA fit at another resolution, on the same coreset."""
+        return GACA(gamma_clustering=gamma, sample_size=self.sample_size,
+                    random_state=self.random_state, kappa=self.kappa,
+                    link_tau=self.link_tau).fit(self.Z_)
+
+    def _regular_suns(self, model):
+        """Genesis Suns big enough to be clusters, judged by expected row count."""
+        scale = self.n_rows_ / max(model.sun_masses_.sum(), 1)
+        lone = model.is_lone(np.arange(model.n_genesis_suns_))
+        return np.flatnonzero(~lone & (model.sun_masses_ * scale >= self.min_cluster_size))
+
+    def _build_hierarchy(self, Z):
+        """Nest every stable resolution of the sweep around the chosen one.
+
+        Every level is fitted on the same coreset, so each coreset particle has
+        a cluster at every level, and the tree is read from the particles:
+
+        * coarser level: each cluster of the level below goes to the coarse
+          cluster that holds most of its particles (merging only);
+        * finer level: each fine Sun goes to the cluster above that holds most
+          of its particles, and each row is assigned to the strongest-pulling
+          Sun among the children of its own cluster (splitting only).
+
+        So the levels are strictly nested. Anomalies stay anomalies at every
+        level."""
+        sel = self.gamma_selection_
+        plateaus = []
+        if sel is not None and self.hierarchy and sel['found']:
+            plateaus = [p for p in sel['plateaus'] if not np.isclose(p['gamma'], self.gamma_)]
+        coarse = sorted((p for p in plateaus if p['gamma'] < self.gamma_),
+                        key=lambda p: -p['gamma'])                    # nearest first
+        fine = sorted((p for p in plateaus if p['gamma'] > self.gamma_),
+                      key=lambda p: p['gamma'])
+        core_chosen = np.array([self._cluster_of.get(int(r), -1)
+                                for r in self.model_.core_labels_])
+
+        # Coarser levels: merge the clusters of the level below.
+        self._coarse_chain = []
+        below_core, below_k = core_chosen, self.n_clusters_
+        for p in coarse:
+            self._log(f"  hierarchy: coarser level at gamma {p['gamma']:.3g}")
+            m = self._level_model(p['gamma'])
+            reg = {int(sun): i for i, sun in enumerate(self._regular_suns(m))}
+            member = np.array([reg.get(int(r), -1) for r in m.core_labels_])
+            raw_parent = np.empty(below_k, dtype=int)
+            for c in range(below_k):
+                votes = member[(below_core == c) & (member >= 0)]
+                raw_parent[c] = np.bincount(votes).argmax() if len(votes) else -(c + 1)
+            _, parent = np.unique(raw_parent, return_inverse=True)
+            if parent.max() + 1 >= below_k:                         # merges nothing
+                continue
+            self._coarse_chain.append(dict(gamma=p['gamma'], parent=parent))
+            below_core = np.where(below_core >= 0, parent[np.maximum(below_core, 0)], -1)
+            below_k = parent.max() + 1
+
+        # Finer levels: split the clusters of the level above.
+        self._fine_levels = []
+        above_core, above_labels, above_k = core_chosen, self.labels_, self.n_clusters_
+        fine_labels = []
+        for p in fine:
+            self._log(f"  hierarchy: finer level at gamma {p['gamma']:.3g}")
+            m = self._level_model(p['gamma'])
+            parent_of_sun = np.full(m.n_genesis_suns_, -1)
+            for sun in self._regular_suns(m):
+                votes = above_core[(m.core_labels_ == sun) & (above_core >= 0)]
+                if len(votes):
+                    parent_of_sun[sun] = np.bincount(votes, minlength=above_k).argmax()
+            sun_of_row = self._children_assign(m, Z, above_labels, parent_of_sun, above_k)
+            keys, counts = np.unique(sun_of_row[sun_of_row != -1], return_counts=True)
+            relabel = {int(k): i for i, k in enumerate(keys[np.argsort(-counts, kind='stable')])}
+            if len(relabel) <= above_k:                              # splits nothing
+                continue
+            labels = self._relabel(sun_of_row, relabel)
+            core_new = self._relabel(
+                self._children_assign(m, m.core_, above_core, parent_of_sun, above_k), relabel)
+            self._fine_levels.append(dict(gamma=p['gamma'], k=len(relabel), model=m,
+                                          parent_of_sun=parent_of_sun, relabel=relabel))
+            fine_labels.append(labels)
+            above_core, above_labels, above_k = core_new, labels, len(relabel)
+
+        levels = []
+        for cl, lab in zip(reversed(self._coarse_chain), self._coarse_labels(self.labels_)):
+            levels.append(dict(gamma=cl['gamma'], k=int(cl['parent'].max() + 1), labels=lab))
+        levels.append(dict(gamma=self.gamma_, k=self.n_clusters_, labels=self.labels_,
+                           chosen=True))
+        for fl, lab in zip(self._fine_levels, fine_labels):
+            levels.append(dict(gamma=fl['gamma'], k=fl['k'], labels=lab))
+        self.levels_ = self._finish_levels(levels)
+
+    def _coarse_labels(self, labels):
+        """Labels at each coarser level, coarsest first."""
+        out, lab = [], labels
+        for cl in self._coarse_chain:
+            lab = np.where(lab >= 0, cl['parent'][np.maximum(lab, 0)], -1)
+            out.append(lab)
+        return out[::-1]
+
+    @staticmethod
+    def _children_assign(m, Z, above_labels, parent_of_sun, above_k):
+        """Sun of model m for each row, chosen only among the children of the
+        row's cluster in the level above. A cluster with no child Sun keeps a
+        single virtual child, coded -(cluster + 2); anomalies stay -1."""
+        children = [np.flatnonzero(parent_of_sun == c) for c in range(above_k)]
+        out = np.full(len(Z), -1)
+        for sl, acc, _ in m._pull_chunks(Z):
+            par = above_labels[sl]
+            allowed = np.zeros(acc.shape, dtype=bool)
+            for c in range(above_k):
+                rows = np.flatnonzero(par == c)
+                if len(children[c]) and len(rows):
+                    allowed[np.ix_(rows, children[c])] = True
+            masked = np.where(allowed, acc, -1.0)
+            best = masked.argmax(axis=1)
+            pulled = masked[np.arange(len(best)), best] > 0
+            for i in np.flatnonzero((par >= 0) & ~pulled):
+                ch = children[par[i]]
+                # no child pulls this row: the heaviest child, or the virtual one
+                best[i] = ch[np.argmax(m.sun_masses_[ch])] if len(ch) else -(par[i] + 2)
+            out[sl] = np.where(par >= 0, best, -1)
+        return out
+
+    @staticmethod
+    def _relabel(values, relabel):
+        return np.array([relabel.get(int(v), -1) if v != -1 else -1 for v in values], dtype=int)
+
+    def _finish_levels(self, levels):
+        """Parents between consecutive levels, and path-style names ('0.2.1')
+        ordered by size within each parent."""
+        for i, lv in enumerate(levels):
+            lab = lv['labels']
+            sizes = np.bincount(lab[lab >= 0], minlength=lv['k'])
+            lv.setdefault('chosen', False)
+            lv['names'] = [''] * lv['k']
+            if i == 0:
+                lv['parent'] = None
+                for rank, c in enumerate(np.argsort(-sizes, kind='stable')):
+                    lv['names'][c] = str(rank)
+                continue
+            up = levels[i - 1]
+            parent = np.zeros(lv['k'], dtype=int)
+            for c in range(lv['k']):
+                above = up['labels'][(lab == c) & (up['labels'] >= 0)]
+                parent[c] = np.bincount(above).argmax() if len(above) else 0
+            lv['parent'] = parent
+            for pc in range(up['k']):
+                kids = [c for c in np.argsort(-sizes, kind='stable') if parent[c] == pc]
+                for rank, c in enumerate(kids):
+                    lv['names'][c] = f"{up['names'][pc]}.{rank}"
+        return levels
+
+    def _hier_labels(self, Z, labels):
+        """Labels at every level for new rows, given their chosen-level labels."""
+        out = self._coarse_labels(labels) + [labels]
+        above, above_k = labels, self.n_clusters_
+        for fl in self._fine_levels:
+            sun = self._children_assign(fl['model'], Z, above, fl['parent_of_sun'], above_k)
+            above, above_k = self._relabel(sun, fl['relabel']), fl['k']
+            out.append(above)
+        return out
+
 
     def _map(self, raw):
         labels = np.full(len(raw), -1)
@@ -507,18 +716,28 @@ class AutoGACA:
         return labels, groups
 
     def _score(self, Z):
-        """-log10 of the pull on each row relative to the median coreset pull.
+        """-log10 of the pull of the regular clusters on each row, relative to
+        the median pull inside the coreset.
 
-        A row that is itself a coreset member does not count its own unit of
-        pull, so coreset outliers score like any other outlier."""
+        Only coreset members of regular clusters pull: members of Lone Suns and
+        anomaly groups do not, so the copies of a sampled anomaly cannot make
+        each other look ordinary. A row that is itself a coreset member does not
+        count its own pull. The sum is taken in log space, so rows far from
+        everything keep a finite score that grows with distance."""
         m = self.model_
-        K = min(m.n_neighbors, len(m.core_))
-        dist, _ = m.core_tree_.query(Z, k=K, workers=-1)
+        if self._regular_tree is None:
+            return np.full(len(Z), np.inf)
+        K = min(m.n_neighbors, self._regular_tree.n)
+        dist, _ = self._regular_tree.query(Z, k=K, workers=-1)
         dist = dist.reshape(len(Z), -1)
-        w = np.exp(-m.gamma_clustering * dist ** 2)
-        w[:, 0] = np.where(dist[:, 0] == 0, 0.0, w[:, 0])
-        median_pull = m.kappa_ / m.kappa
-        return -np.log10(np.maximum(w.sum(1), 1e-300) / median_pull)
+        logw = -m.gamma_clustering * dist ** 2
+        logw[:, 0] = np.where(dist[:, 0] == 0, -np.inf, logw[:, 0])
+        top = logw.max(axis=1, keepdims=True)
+        top = np.where(np.isfinite(top), top, 0.0)
+        log_pull = (top[:, 0] + np.log(np.exp(logw - top).sum(axis=1))
+                    if K else np.full(len(Z), -np.inf))
+        log_median = np.log(m.kappa_ / m.kappa)
+        return -(log_pull - log_median) / np.log(10)
 
     def _set_outputs(self, df, Z, raw):
         self.labels_, self.anomaly_group_ = self._map(raw)
@@ -534,11 +753,16 @@ class AutoGACA:
         df, _ = _as_frame(data)
         Z = self.preprocessor_.transform(df)
         labels, groups = self._map(self.model_.assign(Z))
-        return self._frame(labels, groups, self._score(Z))
+        return self._frame(labels, groups, self._score(Z), self._hier_labels(Z, labels))
 
-    def _frame(self, labels, groups, score):
+    def _frame(self, labels, groups, score, level_labels=None):
         cols = dict(gaca_cluster=labels, gaca_anomaly=labels < 0,
                     gaca_anomaly_group=groups, gaca_anomaly_score=np.round(score, 3))
+        levels = getattr(self, 'levels_', [])
+        if level_labels is not None and len(levels) > 1:
+            for i, (lv, lab) in enumerate(zip(levels, level_labels), start=1):
+                names = np.array(lv['names'] + ['anomaly'], dtype=object)
+                cols[f'gaca_level_{i}'] = names[np.where(lab >= 0, lab, len(lv['names']))]
         try:
             import pandas as pd
             return pd.DataFrame(cols)
@@ -547,7 +771,8 @@ class AutoGACA:
 
     @property
     def result_(self):
-        return self._frame(self.labels_, self.anomaly_group_, self.anomaly_score_)
+        return self._frame(self.labels_, self.anomaly_group_, self.anomaly_score_,
+                           [lv['labels'] for lv in self.levels_])
 
     def _describe(self, df):
         """Per cluster: size, medians of the original columns, and the columns
@@ -570,7 +795,56 @@ class AutoGACA:
                             medians=medians,
                             distinctive=[(used[j], float(diff[j])) for j in order
                                          if abs(diff[j]) >= 0.25]))
+        self.tree_ = self._describe_tree(S, used, overall)
         return out
+
+    def _describe_tree(self, S, used, overall):
+        """One entry per node of the hierarchy, top-down (depth-first): name,
+        level, size, and the columns that set it apart from its parent (or, at
+        the top level, from all rows)."""
+        if len(self.levels_) < 2:
+            return []
+        nodes = []
+
+        def visit(level, c, parent_median):
+            lv = self.levels_[level]
+            mask = lv['labels'] == c
+            med = np.median(S[mask], axis=0)
+            diff = med - parent_median
+            order = np.argsort(-np.abs(diff))[:3]
+            nodes.append(dict(name=lv['names'][c], level=level + 1, size=int(mask.sum()),
+                              share=float(mask.mean()), chosen=lv['chosen'],
+                              cluster=int(c) if lv['chosen'] else None,
+                              distinctive=[(used[j], float(diff[j])) for j in order
+                                           if abs(diff[j]) >= 0.25]))
+            if level + 1 < len(self.levels_):
+                nxt = self.levels_[level + 1]
+                kids = [k for k in range(nxt['k']) if nxt['parent'][k] == c]
+                kids.sort(key=lambda k: _path_key(nxt['names'][k]))
+                if len(kids) > 1:                 # an only child repeats its parent
+                    for k in kids:
+                        visit(level + 1, k, med)
+                elif kids:
+                    deeper(level + 1, kids[0], med)
+
+        def deeper(level, c, parent_median):
+            """Skip levels where a node does not split; continue below them."""
+            nxt_level = level + 1
+            if nxt_level >= len(self.levels_):
+                return
+            nxt = self.levels_[nxt_level]
+            kids = [k for k in range(nxt['k']) if nxt['parent'][k] == c]
+            kids.sort(key=lambda k: _path_key(nxt['names'][k]))
+            if len(kids) > 1:
+                for k in kids:
+                    visit(nxt_level, k, parent_median)
+            elif kids:
+                deeper(nxt_level, kids[0], parent_median)
+
+        top = self.levels_[0]
+        for c in sorted(range(top['k']), key=lambda k: _path_key(top['names'][k])):
+            visit(0, c, overall)
+        return nodes
 
     def summary(self):
         """A short plain-text summary of the fit."""
@@ -593,6 +867,10 @@ class AutoGACA:
                          + (f"  [{d}]" if d else ''))
         if self.n_clusters_ > 10:
             lines.append(f"    ... {self.n_clusters_ - 10} more")
+        if len(self.levels_) > 1:
+            lines.append("  hierarchy: " + " -> ".join(
+                f"{lv['k']}{'*' if lv['chosen'] else ''}" for lv in self.levels_)
+                + " clusters per level (* = the level in gaca_cluster)")
         return "\n".join(lines)
 
     def report(self, path, data=None, title=None):

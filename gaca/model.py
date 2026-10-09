@@ -249,17 +249,14 @@ class GACA(BaseEstimator):
             return self._assign_to_suns(X)
         return self._pull_route(X)[0]
 
-    def _pull_route(self, X):
-        """Per-Sun Gaussian pull of the nearest coreset members.
+    def _pull_chunks(self, X):
+        """Yield (slice, per-Sun pull table, total pull) for row chunks of X.
 
-        Returns the strongest-pulling genesis Sun (-1 if the total pull is below
-        ``kappa_``) and the total pull of every row.
-        """
+        The table has one column per genesis Sun: the summed Gaussian pull of
+        that Sun's members among the row's nearest coreset members."""
         n, n_suns = len(X), self.n_genesis_suns_
         K = min(self.n_neighbors, len(self.core_))
-        labels = np.empty(n, dtype=int)
-        total = np.empty(n)
-        chunk = max(1000, int(2e7 // max(n_suns, 1)))   # bounds the n x K pull table
+        chunk = max(1000, int(2e7 // max(n_suns, 1)))   # bounds the n x n_suns table
         for s in range(0, n, chunk):
             Xc = X[s:s + chunk]
             dist, idx = self.core_tree_.query(Xc, k=K, workers=-1)
@@ -271,8 +268,19 @@ class GACA(BaseEstimator):
             rows = np.arange(len(Xc))
             for c in range(K):
                 acc[rows, S[:, c]] += W[:, c]
-            labels[s:s + chunk] = acc.argmax(axis=1)
-            total[s:s + chunk] = W.sum(axis=1)
+            yield slice(s, s + len(Xc)), acc, W.sum(axis=1)
+
+    def _pull_route(self, X):
+        """Per-Sun Gaussian pull of the nearest coreset members.
+
+        Returns the strongest-pulling genesis Sun (-1 if the total pull is below
+        ``kappa_``) and the total pull of every row.
+        """
+        labels = np.empty(len(X), dtype=int)
+        total = np.empty(len(X))
+        for sl, acc, tot in self._pull_chunks(X):
+            labels[sl] = acc.argmax(axis=1)
+            total[sl] = tot
         labels[total < self.kappa_] = -1
         return labels, total
 

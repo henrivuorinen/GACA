@@ -4,7 +4,7 @@ Two test tables from the Sloan Digital Sky Survey, downloaded through its
 public SQL service (no account needed):
 
 ```bash
-pip install -e ".[cli]"
+pip install -e .                          # in a clone of the repository
 python examples/sdss/fetch_sdss.py        # writes data/sdss_objects.csv and
                                           # data/sdss_galaxy_positions.csv
 ```

@@ -165,6 +165,33 @@ def _anomaly_rows(auto, data, top=25):
     return f'<div class="scroll"><table>{head}{"".join(rows)}</table></div>'
 
 
+def _tree_html(auto):
+    """The cluster hierarchy as an indented table, top-down."""
+    levels = auto.levels_
+    head = ("<h2>Cluster tree</h2><p class='muted'>The data has stable structure at "
+            f"{len(levels)} resolutions: " + " → ".join(
+                f"{lv['k']} clusters" for lv in levels) +
+            ". Each cluster splits into the sub-clusters listed under it. A node is "
+            "described by what sets it apart from its parent (top level: from all rows). "
+            "Every level is in <code>labels.csv</code> as <code>gaca_level_1</code>, "
+            "<code>gaca_level_2</code>, …; <b>bold</b> rows are the level used for "
+            "<code>gaca_cluster</code>.</p>")
+    rows = []
+    for n in auto.tree_:
+        pad = 8 + 22 * (n['level'] - 1)
+        top = n['name'].split('.')[0]
+        col = PALETTE[int(top)] if top.isdigit() and int(top) < len(PALETTE) else OTHER
+        feats = ", ".join(f"{_e(c)} {'▲' if d > 0 else '▼'} {abs(d):.1f}"
+                          for c, d in n['distinctive']) or '–'
+        tag = f" <span class='muted'>(cluster {n['cluster']})</span>" if n['chosen'] else ''
+        weight = "font-weight:600;" if n['chosen'] else ''
+        rows.append(f"<tr><td style='padding-left:{pad}px;{weight}'>"
+                    f"<span class='swatch' style='background:{col}'></span>{_e(n['name'])}{tag}</td>"
+                    f"<td>{n['size']:,}</td><td>{100 * n['share']:.1f}%</td><td>{feats}</td></tr>")
+    return (head + "<div class='scroll'><table><tr><th>Cluster</th><th>Rows</th><th>Share</th>"
+            "<th>Sets it apart</th></tr>" + "".join(rows) + "</table></div>")
+
+
 def write_report(auto, path, data=None, title=None):
     p = auto.preprocessor_
     sel = auto.gamma_selection_
@@ -210,6 +237,9 @@ def write_report(auto, path, data=None, title=None):
                     f"<td>{cl['size']:,}</td><td>{100 * cl['share']:.1f}%</td><td>{dist or '–'}</td>"
                     + "".join(f"<td>{_fmt(cl['medians'][c])}</td>" for c in show_cols) + "</tr>")
     parts.append(f"<div class='scroll'><table>{head}{''.join(body)}</table></div>")
+
+    if getattr(auto, 'tree_', None):
+        parts.append(_tree_html(auto))
 
     parts.append("<h2>Map</h2><p class='muted'>Rows projected on the two main axes of the "
                  "clustering space (a flat view of a higher-dimensional space, so clusters can "

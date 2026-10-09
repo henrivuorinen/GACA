@@ -124,3 +124,47 @@ def test_bandwidth_sets_gamma():
     auto = AutoGACA(bandwidth=2.0).fit(X)
     assert auto.gamma_selection_ is None
     assert np.isclose(auto.gamma_, 1 / 8)
+
+
+def _two_level_data():
+    centers = [[0, 0], [1.6, 0], [0.8, 1.4], [12, 0], [13.6, 0], [12.8, 1.4]]
+    X, y = make_blobs(4000, centers=centers, cluster_std=0.3, random_state=0)
+    return X, y
+
+
+def test_hierarchy_finds_groups_and_subgroups():
+    X, y = _two_level_data()
+    auto = AutoGACA(scale='none').fit(X)
+    ks = [lv['k'] for lv in auto.levels_]
+    assert 2 in ks and 6 in ks
+    two = next(lv for lv in auto.levels_ if lv['k'] == 2)
+    six = next(lv for lv in auto.levels_ if lv['k'] == 6)
+    assert adjusted_rand_score(y >= 3, two['labels']) > 0.95
+    assert adjusted_rand_score(y, six['labels']) > 0.9
+
+
+def test_hierarchy_levels_are_nested_and_named_by_path():
+    X, _ = _two_level_data()
+    auto = AutoGACA(scale='none').fit(X)
+    for up, lo in zip(auto.levels_, auto.levels_[1:]):
+        for c in range(lo['k']):
+            parents = set(up['labels'][lo['labels'] == c].tolist())
+            assert len(parents) == 1
+            assert lo['names'][c].startswith(up['names'][parents.pop()] + '.')
+    assert sum(lv['chosen'] for lv in auto.levels_) == 1
+
+
+def test_hierarchy_columns_for_new_rows():
+    pytest.importorskip("pandas")
+    X, _ = _two_level_data()
+    auto = AutoGACA(scale='none').fit(X)
+    out = auto.assign(X[:50])
+    cols = [c for c in out.columns if c.startswith('gaca_level_')]
+    assert len(cols) == len(auto.levels_)
+    assert (out[cols[-1]].to_numpy() == auto.result_[cols[-1]].to_numpy()[:50]).all()
+
+
+def test_no_hierarchy_when_disabled_or_gamma_given():
+    X, _ = _two_level_data()
+    assert len(AutoGACA(scale='none', hierarchy=False).fit(X).levels_) == 1
+    assert len(AutoGACA(scale='none', bandwidth=0.5).fit(X).levels_) == 1

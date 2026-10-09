@@ -102,7 +102,10 @@ def run(args):
         stable_plateau=None if auto.gamma_selection_ is None else bool(auto.gamma_selection_['found']),
         epsilon=auto.model_.epsilon_, link_tau=auto.link_tau,
         clusters=[dict(cluster=int(k), rows=int(c)) for k, c in enumerate(counts)],
-        anomalous_rows=int(n_anom), seconds=round(time.time() - t0, 1), note=note)
+        anomalous_rows=int(n_anom), seconds=round(time.time() - t0, 1), note=note,
+        hierarchy=[dict(level=i, gamma=lv['gamma'], clusters=int(lv['k']),
+                        in_gaca_cluster=bool(lv['chosen']))
+                   for i, lv in enumerate(auto.levels_, start=1)])
     with open(os.path.join(out, "summary.json"), "w") as f:
         json.dump(summary, f, indent=2, default=float)
 

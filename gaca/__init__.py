@@ -15,4 +15,4 @@ from .auto import AutoGACA, Preprocessor, select_gamma
 
 __all__ = ["GACA", "AutoGACA", "Preprocessor", "select_gamma", "GACANode", "assign",
            "kernel_pull", "merge_connected_components", "saddle_link", "solar_genesis"]
-__version__ = "1.1.0"
+__version__ = "1.2.0"
