@@ -209,3 +209,113 @@ def test_outliers_and_spikes_do_not_trigger_group_scaling():
     from gaca.auto import _within_mode_spread
     assert _within_mode_spread(with_outliers, 1.0) is None
     assert _within_mode_spread(with_spike, 1.0) is None
+
+
+def test_resolution_separates_groups_at_least_that_far_apart():
+    rng = np.random.default_rng(0)
+    X = np.vstack([rng.normal(0, 0.6, (500, 2)) + [i * 4.0, 0] for i in range(3)])
+    assert AutoGACA(scale='none', resolution=4.0, link_view=False).fit(X).n_clusters_ == 3
+    assert AutoGACA(scale='none', resolution=12.0, link_view=False).fit(X).n_clusters_ == 1
+
+
+def test_resolution_and_bandwidth_are_exclusive():
+    X, _ = _blobs_with_anomalies()
+    with pytest.raises(ValueError):
+        AutoGACA(bandwidth=1.0, resolution=3.0).fit(X)
+
+
+def test_cluster_rules_describe_clusters_in_original_units():
+    rng = np.random.default_rng(0)
+    a = np.c_[rng.normal(10, 1, 1500), rng.normal(100, 5, 1500)]      # low x, any y
+    b = np.c_[rng.normal(30, 1, 1500), rng.normal(100, 5, 1500)]      # high x
+    auto = AutoGACA(link_view=False).fit(np.vstack([a, b]))
+    rules = [c['rule'] for c in auto.clusters_]
+    assert len(rules) == 2
+    for r in rules:
+        assert r['precision'] > 0.95 and r['recall'] > 0.95
+        assert r['text'].startswith('x0')                              # split on x, not y
+        thr = float(r['text'].split()[-1].replace(',', ''))
+        assert 12 < thr < 28                                           # threshold in data units
+
+
+def _stream_batch(n, p=(0.5, 0.3, 0.2), seed=0, extra=None):
+    r = np.random.default_rng(seed)
+    centers = np.array([[0, 0, 0], [6, 0, 0], [0, 6, 0]], float)
+    X = centers[r.choice(3, n, p=p)] + r.normal(0, 0.8, (n, 3))
+    return X if extra is None else np.vstack([X, extra])
+
+
+def test_drift_flags_real_changes_but_not_noise():
+    auto = AutoGACA(link_view=False).fit(_stream_batch(4000, seed=1))
+    same = [auto.drift(auto.assign(_stream_batch(300, seed=s))) for s in range(10, 20)]
+    assert not any(d['drift'] for d in same)
+    shifted = auto.drift(auto.assign(_stream_batch(2000, p=(0.2, 0.3, 0.5), seed=2)))
+    assert shifted['drift'] and 'cluster mix' in shifted['reasons']
+    far = np.random.default_rng(3).normal(0, 0.5, (100, 3)) + 20
+    novel = auto.drift(auto.assign(_stream_batch(1900, seed=4, extra=far)))
+    assert novel['drift'] and 'anomaly rate' in novel['reasons'] and novel['new_groups'] >= 1
+
+
+def test_cli_streaming_writes_drift_file(tmp_path):
+    pd = pytest.importorskip("pandas")
+    from gaca.cli import main
+    # a time-ordered file whose last tenth has a different mix
+    X = np.vstack([_stream_batch(9000, seed=1), _stream_batch(1000, p=(0.1, 0.1, 0.8), seed=2)])
+    src = tmp_path / "stream.csv"
+    pd.DataFrame(X, columns=['a', 'b', 'c']).to_csv(src, index=False)
+    out = tmp_path / "out"
+    main(['run', str(src), '--chunksize', '1000', '--fit-rows', '5000', '--out', str(out),
+          '--quiet', '--no-link-view'])
+    drift = pd.read_csv(out / "drift.csv")
+    assert len(drift) == 10
+    assert not drift['drift'].iloc[:9].any()
+    assert drift['drift'].iloc[-1] and not drift['drift'].iloc[0]
+
+
+def test_compare_scores_against_known_labels_with_baselines():
+    X, y = _blobs_with_anomalies()
+    auto = AutoGACA(link_view=False).fit(X)
+    cmp_ = auto.compare(np.where(y >= 0, y.astype(str), 'odd'), baselines=True)
+    names = [m['method'] for m in cmp_['methods']]
+    assert names[0] == 'GACA' and any('K-Means' in n for n in names) and 'HDBSCAN' in names
+    assert cmp_['methods'][0]['ari'] > 0.95
+    assert all(c['purity'] > 0.95 for c in cmp_['clusters'])
+
+
+def test_cli_truth_column_is_excluded_and_reported(tmp_path):
+    pd = pytest.importorskip("pandas")
+    from gaca.cli import main
+    X, y = _blobs_with_anomalies()
+    df = pd.DataFrame(X, columns=['a', 'b', 'c'])
+    df['kind'] = np.where(y >= 0, y, -1)
+    src = tmp_path / "d.csv"
+    df.to_csv(src, index=False)
+    out = tmp_path / "o"
+    main(['run', str(src), '--truth', 'kind', '--out', str(out), '--quiet', '--no-link-view'])
+    summary = json.loads((out / "summary.json").read_text())
+    assert summary['columns_used'] == ['a', 'b', 'c']
+    assert summary['comparison']['methods'][0]['ari'] > 0.95
+    assert 'Comparison with known labels' in (out / "report.html").read_text()
+
+
+def test_level_choice_prefers_the_finer_of_equally_long_plateaus():
+    # The benchmark's 'anisotropic' set. At some other sizes the coarser plateau
+    # is a grid point longer and wins (see docs/theory.md section 5).
+    X, y = make_blobs(6000, centers=4, cluster_std=0.8, random_state=3)
+    X = X @ np.array([[0.6, -0.6], [-0.4, 0.8]])                     # the 'anisotropic' set
+    auto = AutoGACA(link_view=False).fit(X)
+    assert adjusted_rand_score(y, auto.labels_) > 0.9
+
+
+def test_rare_dense_group_scores_as_anomalous_without_new_flags():
+    rng = np.random.default_rng(0)
+    bulk = np.vstack([rng.normal(0, 1, (3000, 3)), rng.normal([8, 0, 0], 1, (3000, 3))])
+    rare = rng.normal([4, 9, 0], 0.3, (60, 3))                       # 1% of rows, dense, apart
+    X = np.vstack([bulk, rare])
+    on = AutoGACA(link_view=False).fit(X)
+    off = AutoGACA(link_view=False, rare_share=0).fit(X)
+    from sklearn.metrics import roc_auc_score
+    truth = np.r_[np.zeros(len(bulk), bool), np.ones(len(rare), bool)]
+    assert roc_auc_score(truth, on.anomaly_score_) > roc_auc_score(truth, off.anomaly_score_)
+    assert roc_auc_score(truth, on.anomaly_score_) > 0.95
+    assert np.array_equal(on.anomaly_, off.anomaly_)

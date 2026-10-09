@@ -4,6 +4,52 @@ Versions follow [semantic versioning](https://semver.org): bug fixes raise the
 last number, new features the middle one, and changes that break existing code
 the first.
 
+## Unreleased
+
+### Changed
+- **Better automatic level choice.** Among equally long plateaus, the finest
+  one whose stability is within 0.1 of the most stable is chosen. Mean ARI:
+  development sets 0.63 → 0.73, held-out OpenML sets 0.30 → 0.41.
+- **Rare groups in the anomaly score.** Clusters holding less than 5% of the
+  rows pull with a weight proportional to their share (`rare_share`), so
+  small, dense, isolated groups score as anomalous. Flags are unchanged. KDD
+  Cup ROC AUC: 0.41 → 0.79; held-out shuttle: 0.80 → 0.98.
+
+### Added
+- **`--truth COLUMN` and `--baselines`:** score the clustering against known
+  labels (kept out of the clustering) in a report section. Optionally K-Means
+  and HDBSCAN are scored on the same preprocessed data. In Python:
+  `AutoGACA.compare()`.
+- **`--fit-first`:** with `--chunksize`, fit on the start of a time-ordered
+  file, so drift is measured against it. The report charts drift per chunk.
+- **A third SDSS example file** (`sdss_timeline.csv`, original survey then
+  BOSS) with a real change for trying drift monitoring.
+- `experiments/benchmark_openml.py`: GACA, HDBSCAN, K-Means, Isolation Forest
+  and LOF on seven public OpenML datasets from finance, agriculture, biology,
+  image analysis, handwriting, medicine and aerospace. Results, including the
+  weak spots, are in the README.
+- **Drift monitoring.** `AutoGACA.drift()` compares a batch of new rows with
+  the fitted data (cluster-mix shift, anomaly rate, new anomaly groups) and
+  flags changes that are both large and significant. With `--chunksize` the
+  CLI writes `drift.csv`. In tests there were no false alarms on 30 unchanged
+  batches, and every real shift was caught.
+- **Cluster rules.** Each cluster gets a short rule in the original column
+  units, with precision and recall, in the report, the summary and
+  `summary.json`. On SDSS objects the quasar cluster is
+  `redshift > 0.745 and u ≤ 20.9` (99% / 97%).
+- `resolution=` / `--resolution D`: keep groups at least D apart separate. γ
+  is derived from the resolution law (`resolution_to_gamma`, `critical_gap`).
+  On SDSS galaxy positions, `--resolution 3.3` (Mpc) recovers the Coma
+  cluster as the largest group.
+- `docs/theory.md`: the mathematics behind GACA's behaviour and design
+  choices. Its new resolution law has two parts:
+  - **Proved, for two Suns:** the exact gap map, inevitable collapse, bounds
+    on the merge time, and a critical gap of h√(2 ln T)(1 + o(1)).
+  - **Approximated, for clusters with a spread:** a mean-field model checked
+    against simulations.
+
+  `experiments/resolution_law.py` verifies the numbers.
+
 ## 1.3.0
 
 ### Added

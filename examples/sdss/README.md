@@ -51,11 +51,14 @@ by hand rather than chosen automatically:
 
 ```bash
 gaca run data/sdss_galaxy_positions.csv --columns tx,ty,los \
-    --scale none --bandwidth 1 --sample-size 20000
+    --scale none --resolution 3.3 --sample-size 20000
 ```
 
 - **`--scale none`:** positions are already in Mpc, so they are not rescaled.
-- **`--bandwidth 1`:** a 1 Mpc kernel, about the size of a cluster core.
+- **`--resolution 3.3`:** keep groups whose centres are more than 3.3 Mpc
+  apart separate. GACA turns this into a kernel width (here 1 Mpc, about the
+  size of a cluster core) using the resolution law in `docs/theory.md`.
+  `--bandwidth 1` sets the same kernel directly.
 - **`tx, ty, los`:** sky-plane coordinates in Mpc, plus the line-of-sight
   distance divided by 10. Galaxies orbiting inside a cluster at ~1,000 km/s
   smear its redshift distance by over ±10 Mpc along the line of sight (the
@@ -70,6 +73,54 @@ population: about 70% of galaxies at this scale.
 
 Comparing against friends-of-friends group catalogues (e.g. Tempel et al. 2017
 for SDSS) would be the natural next test.
+
+## 3. Try the newer features, with known answers
+
+These commands exercise the features added in 1.4 and put the results in the
+report (`<out>/report.html`). Each compares against something known.
+
+**Compare against SDSS's own classes and against other methods**:
+
+```bash
+gaca run data/sdss_objects.csv --exclude ra,dec,subClass \
+    --truth class --baselines --out data/sdss_objects_gaca
+```
+
+- `--truth class` keeps the class column out of the clustering and adds a
+  *Comparison with known labels* section: ARI and NMI for GACA's main view,
+  linked view and best hierarchy level.
+- `--baselines` adds K-Means (given the true number of classes) and HDBSCAN
+  on the same preprocessed data.
+- The cluster table now has a **rule** for each cluster in plain thresholds.
+
+In our run, HDBSCAN matched the three classes best (ARI 0.61), GACA's levels
+scored 0.47 to 0.50, and K-Means 0.35. GACA's clusters are purer but finer:
+it separates quasars by redshift, which the three-class labels do not reward.
+
+**Detect a real change in the data** (drift):
+
+```bash
+gaca run data/sdss_timeline.csv --exclude ra,dec,mjd,plate,subClass --truth class \
+    --chunksize 5000 --fit-rows 15000 --fit-first --out data/sdss_timeline_gaca
+```
+
+The file is in observation order. Its first half comes from the original SDSS
+survey and its second half from BOSS (from December 2009), which targeted more
+distant galaxies and quasars (median redshift 0.1, then 0.5). `--fit-first`
+fits on the first 15,000 rows, so the *Drift across the file* section charts
+how each chunk differs from the start. In our run, chunks 0 to 5 were not
+flagged, and all six BOSS chunks were (cluster mix moved by 0.17 to 0.20;
+anomaly rate 1% → 17 to 21%, the new kinds of objects).
+
+**Set the resolution in physical units**:
+
+```bash
+gaca run data/sdss_galaxy_positions.csv --columns tx,ty,los \
+    --scale none --resolution 3.3 --sample-size 20000 --out data/sdss_groups_gaca
+```
+
+This keeps galaxy groups more than 3.3 Mpc apart separate. The largest group
+is Coma (about 1,000 galaxies).
 
 ## Your own data
 
