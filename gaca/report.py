@@ -202,6 +202,85 @@ def _link_view_html(auto):
             "coloured by the linked view:</p>" + _scatter_svg(auto, labels=link))
 
 
+def _comparison_html(auto, truth_name):
+    """GACA (and baselines) scored against a known label column."""
+    cmp_ = auto.comparison_
+    head = (f"<h2>Comparison with known labels: <code>{_e(truth_name)}</code></h2>"
+            f"<p class='muted'>The column <code>{_e(truth_name)}</code> "
+            f"({cmp_['n_labels']} distinct values) was left out of the clustering and "
+            "is used only here. ARI (adjusted Rand index) and NMI (normalised mutual "
+            "information) are 1 for a perfect match and 0 for chance. Note that a clustering "
+            "can be right and still score low when the data has finer or different natural "
+            "groups than the labels. Baselines run on the same preprocessed data.</p>")
+    rows = "".join(
+        f"<tr><td>{_e(m['method'])}</td><td class='muted'>{_e(m['note'])}</td>"
+        f"<td>{m['ari']:.3f}</td><td>{m['nmi']:.3f}</td><td>{m['clusters']}</td>"
+        f"<td>{100 * m['covered']:.0f}%</td></tr>" for m in cmp_['methods'])
+    table = ("<div class='scroll'><table><tr><th>Method</th><th></th><th>ARI</th><th>NMI</th>"
+             "<th>Clusters</th><th>Rows clustered</th></tr>" + rows + "</table></div>")
+    crow = []
+    for c in cmp_['clusters']:
+        k = c['cluster']
+        col = PALETTE[k] if k < len(PALETTE) else OTHER
+        labs = ", ".join(f"{_e(n)} {100 * v:.0f}%" for n, v in c['labels'])
+        crow.append(f"<tr><td><span class='swatch' style='background:{col}'></span>{k}</td>"
+                    f"<td>{c['size']:,}</td><td>{100 * c['purity']:.0f}%</td><td>{labs}</td></tr>")
+    ctable = ("<p class='muted' style='margin-top:16px'>What each GACA cluster contains "
+              "(purity = share of its commonest label):</p><div class='scroll'><table>"
+              "<tr><th>Cluster</th><th>Rows</th><th>Purity</th><th>Known labels</th></tr>"
+              + "".join(crow) + "</table></div>")
+    return head + table + ctable
+
+
+def _drift_html(drift):
+    """Per-chunk drift: cluster-mix shift and anomaly rate, flagged chunks in red."""
+    n = len(drift)
+    if not n:
+        return ''
+    W, H, L, R, T, gap = 960, 250, 50, 20, 16, 34
+    ph = (H - T - gap - 26) / 2
+    x = lambda i: L + (i + 0.5) / n * (W - L - R)
+    shift = [d['cluster_shift'] for d in drift]
+    rate = [100 * d['anomaly_rate'] for d in drift]
+    smax = max(0.2, max(shift) * 1.1)
+    rmax = max(1.0, max(rate) * 1.1)
+    ys = lambda v: T + ph - v / smax * ph
+    yr = lambda v: T + ph + gap + ph - v / rmax * ph
+    bw = max(2.0, (W - L - R) / n * 0.7)
+    out = [f'<svg viewBox="0 0 {W} {H}" width="100%" role="img" aria-label="Drift per chunk">']
+    out.append(f'<text x="{L}" y="{T - 3}">cluster-mix shift (flag above 0.1)</text>')
+    out.append(f'<text x="{L}" y="{T + ph + gap - 3}">anomalous rows, %</text>')
+    out.append(f'<line x1="{L}" x2="{W - R}" y1="{ys(0.1):.1f}" y2="{ys(0.1):.1f}" '
+               f'stroke="var(--muted)" stroke-dasharray="4 3"/>')
+    for i, d in enumerate(drift):
+        col = 'var(--anom)' if d['drift'] else 'var(--accent)'
+        tip = (f"chunk {d['chunk']}: shift {d['cluster_shift']:.3f}, anomalies "
+               f"{100 * d['anomaly_rate']:.2f}%, new groups {d['new_groups']}"
+               + (f" | {d['reasons']}" if d['drift'] else ''))
+        out.append(f'<rect x="{x(i) - bw / 2:.1f}" y="{ys(shift[i]):.1f}" width="{bw:.1f}" '
+                   f'height="{T + ph - ys(shift[i]):.1f}" fill="{col}"><title>{_e(tip)}</title></rect>')
+        out.append(f'<rect x="{x(i) - bw / 2:.1f}" y="{yr(rate[i]):.1f}" width="{bw:.1f}" '
+                   f'height="{T + 2 * ph + gap - yr(rate[i]):.1f}" fill="{col}"><title>{_e(tip)}</title></rect>')
+    for v in (0, smax / 2):
+        out.append(f'<text x="{L - 6}" y="{ys(v) + 4:.1f}" text-anchor="end">{v:.2f}</text>')
+    for v in (0, rmax / 2):
+        out.append(f'<text x="{L - 6}" y="{yr(v) + 4:.1f}" text-anchor="end">{v:.1f}</text>')
+    step = max(1, n // 10)
+    for i in range(0, n, step):
+        out.append(f'<text x="{x(i):.1f}" y="{H - 6}" text-anchor="middle">{drift[i]["chunk"]}</text>')
+    out.append('</svg>')
+    flagged = [d for d in drift if d['drift']]
+    head = ("<h2>Drift across the file</h2><p class='muted'>Each bar is one chunk of the file, "
+            "compared with the data the model was fitted on. A chunk is flagged (red) when its "
+            "cluster mix moved by more than 0.1 (total variation) or its anomaly rate rose more "
+            "than 3 times, and the change is statistically significant (p &lt; 0.001). Hover "
+            "over a bar for details; all numbers are in <code>drift.csv</code>.</p>")
+    summary = (f"<p>{len(flagged)} of {n} chunks flagged"
+               + (": " + "; ".join(f"chunk {d['chunk']} ({_e(d['reasons'])})" for d in flagged[:6])
+                  + (" …" if len(flagged) > 6 else '') if flagged else '') + ".</p>")
+    return head + "".join(out) + summary
+
+
 def _tree_html(auto):
     """The cluster hierarchy as an indented table, top-down."""
     levels = auto.levels_
@@ -229,7 +308,7 @@ def _tree_html(auto):
             "<th>Sets it apart</th></tr>" + "".join(rows) + "</table></div>")
 
 
-def write_report(auto, path, data=None, title=None):
+def write_report(auto, path, data=None, title=None, truth_name=None, drift=None):
     p = auto.preprocessor_
     sel = auto.gamma_selection_
     n_anom = int(auto.anomaly_.sum())
@@ -260,9 +339,15 @@ def write_report(auto, path, data=None, title=None):
     # Clusters
     parts.append("<h2>Clusters</h2><p class='muted'>Largest first. <em>Sets it apart</em> lists the "
                  "columns whose median in the cluster differs most from the overall median, in "
-                 "units of the column's spread (interquartile range / 1.35).</p>")
+                 "units of the column's spread (interquartile range / 1.35). <em>Rule</em> is a "
+                 "short description in the columns' own units, found by a small decision tree: "
+                 "<em>precision</em> is the share of rows matching the rule that are in the "
+                 "cluster, <em>recall</em> the share of the cluster that matches it. A rule with "
+                 "low values means the cluster has no simple description in a few "
+                 "thresholds.</p>")
     show_cols = p.used_[:6]
     head = ("<tr><th>Cluster</th><th>Rows</th><th>Share</th><th>Sets it apart</th>"
+            "<th>Rule (precision / recall)</th>"
             + "".join(f"<th>median {_e(c)}</th>" for c in show_cols) + "</tr>")
     body = []
     for cl in auto.clusters_:
@@ -270,13 +355,27 @@ def write_report(auto, path, data=None, title=None):
         col = PALETTE[k] if k < len(PALETTE) else OTHER
         dist = ", ".join(f"<span class='{'up' if d > 0 else 'down'}'>{_e(n)} "
                          f"{'▲' if d > 0 else '▼'} {abs(d):.1f}</span>" for n, d in cl['distinctive'][:3])
+        rule = cl.get('rule')
+        if rule and rule['text']:
+            weak = rule['precision'] < 0.5 or rule['recall'] < 0.5
+            rule_html = (f"<span{' class=muted' if weak else ''}>{_e(rule['text'])}"
+                         f" ({100 * rule['precision']:.0f}% / {100 * rule['recall']:.0f}%)</span>")
+        else:
+            rule_html = '–'
         body.append(f"<tr><td><span class='swatch' style='background:{col}'></span>{k}</td>"
                     f"<td>{cl['size']:,}</td><td>{100 * cl['share']:.1f}%</td><td>{dist or '–'}</td>"
+                    f"<td>{rule_html}</td>"
                     + "".join(f"<td>{_fmt(cl['medians'][c])}</td>" for c in show_cols) + "</tr>")
     parts.append(f"<div class='scroll'><table>{head}{''.join(body)}</table></div>")
 
+    if getattr(auto, 'comparison_', None) is not None:
+        parts.append(_comparison_html(auto, truth_name or 'labels'))
+
     if getattr(auto, 'tree_', None):
         parts.append(_tree_html(auto))
+
+    if drift:
+        parts.append(_drift_html(drift))
 
     parts.append("<h2>Map</h2><p class='muted'>Rows projected on the two main axes of the "
                  "clustering space (a flat view of a higher-dimensional space, so clusters can "
@@ -315,7 +414,9 @@ def write_report(auto, path, data=None, title=None):
                  f"{100 * p.pca_.explained_variance_ratio_.sum():.0f}% of variance"
                  if p.pca_ is not None else f"not needed ({len(p.used_)} ≤ max_dims {p.max_dims})"),
                 ("γ", f"{auto.gamma_:.4g}" + (" (automatic)" if sel is not None else
-                       f" (from bandwidth {auto.bandwidth:g})" if auto.bandwidth else " (given)")),
+                       f" (from bandwidth {auto.bandwidth:g})" if auto.bandwidth else
+                       f" (from resolution {auto.resolution:g})" if getattr(auto, 'resolution', None)
+                       else " (given)")),
                 ("ε", f"{auto.model_.epsilon_:.3g}"), ("coreset", f"{len(auto.model_.core_):,} rows"),
                 ("saddle linking", f"τ = {auto.link_tau}" if auto.link_tau else
                  ("off (shown as the alternative view)" if getattr(auto, 'linked_labels_', None)

@@ -346,3 +346,36 @@ def saddle_link(Z, members, w, gamma, tau=0.5, kappa=0.0, n_neighbors=10,
     roots = np.array([find(a) for a in range(n_suns)])
     _, new_label = np.unique(roots, return_inverse=True)
     return new_label, pull
+
+
+def critical_gap(n_iterations=20, eta=0.5, spread=1.0):
+    """Smallest gap, in kernel widths h, at which two equal Gaussian clusters of
+    spread ``spread`` (also in units of h) survive ``n_iterations`` steps as
+    separate Suns. Uses the mean-field recursion of docs/theory.md section 1.5,
+    with "the gap halves" as the merge criterion. At ``spread=0`` it is the
+    equal-mass two-Sun map of section 1.1."""
+    def final_gap(gap):
+        s, g = spread, gap
+        for _ in range(n_iterations):
+            v = s * s + 1.0
+            r = np.exp(-g * g / (2.0 * v))
+            g *= 1.0 - 2.0 * eta * r / (1.0 + r) / v
+            s *= 1.0 - eta / v
+        return g
+
+    lo, hi = 0.1, 50.0
+    for _ in range(60):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if final_gap(mid) < 0.5 * mid else (lo, mid)
+    return 0.5 * (lo + hi)
+
+
+def resolution_to_gamma(resolution, n_iterations=20, eta=0.5):
+    """The gamma at which groups at least ``resolution`` apart stay separate.
+
+    The kernel width is h = resolution / critical_gap(...), computed for groups
+    as wide as the kernel (spread = h). That is conservative for compact groups
+    (for point masses the proved critical gap is smaller). Returns
+    gamma = 1 / (2 h^2). For the defaults, h is about resolution / 3.3."""
+    h = float(resolution) / critical_gap(n_iterations, eta, spread=1.0)
+    return 1.0 / (2.0 * h * h)

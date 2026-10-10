@@ -127,6 +127,9 @@ What it decides, and how:
 | Dimensions | Unchanged up to `max_dims` columns (default 10). Above that, PCA to between 5 and `max_dims` components, the number set by the noise floor of the singular values (Gavish and Donoho). |
 | γ | Swept as c / (median squared distance between rows). At each value GACA is fitted on four subsamples. γ is the middle of the most stable stretch of the longest plateau in the cluster count. A split only counts if the subsamples agree (adjusted Rand index ≥ 0.8). Otherwise the answer is one group. |
 | Anomalies | Rows that no cluster pulls, plus clusters smaller than `min_cluster_size` (10 rows). Score = −log10 of the pull relative to a typical row; above 3 is anomalous. |
+| Drift monitoring | With `--chunksize` (or `auto.drift(auto.assign(batch))` in Python), each batch is compared with the fitted data. It is flagged when the cluster mix moves by more than 0.1 (total variation) or the anomaly rate rises more than 3×, and the change is statistically significant (chi-square or binomial test, p < 0.001). Per-chunk results go to `drift.csv`. The CLI fits on a sample of the whole file, so it flags chunks that differ from the file as a whole; to monitor new data against a fixed reference, fit once and call `drift()` on each new batch. |
+| Cluster rules | Each cluster gets a short rule in the columns' own units, from a depth-3 decision tree, with its precision and recall: on SDSS, `redshift > 0.745 and u ≤ 20.9` picks out the quasar cluster (99% / 97%), and `1.39 < r_i ≤ 2.92 and i_z > 0.672` the M dwarfs (95% / 98%). |
+| Resolution | Instead of choosing γ automatically, `resolution=` / `--resolution D` keeps groups at least D apart (in the clustering space's units; physical units with `scale='none'`) separate, with γ derived from the resolution law below. `bandwidth=` sets the kernel width directly. |
 | Hierarchy | Every stable resolution of the sweep is kept, fitted on the same coreset and nested into a tree: each fine cluster sits under the coarse cluster holding most of its particles, and each row is assigned within its own branch. `gaca_cluster` is the level the rule above picks; `gaca_level_1 … gaca_level_K` hold all levels as path-style names (`0`, `0.2`, `0.2.1`). `hierarchy=False` turns it off. |
 | Linked view | A second clustering with saddle linking (its own automatic γ), better for curved or elongated groups and worse for overlapping ones. It is in `gaca_linked_cluster`, and the report shows it when it disagrees with the main view. `link_view=False` / `--no-link-view` skips it. |
 | Speed | The sweep's fits and the hierarchy levels run in parallel threads (`n_jobs`, `--jobs`; up to 8 by default), with identical results. |
@@ -216,14 +219,14 @@ rows, K-Means given the true k as a reference):
 |---|---|---|---|---|
 | wine | **0.85** | 0.00 | 0.27 | 0.85 |
 | breast cancer | **0.56** | 0.01 | 0.08 | 0.69 |
-| digits | **0.18** | 0.17 | **0.18** | 0.52 |
+| digits | **0.56** | 0.17 | 0.18 | 0.52 |
 | uneven blobs 5-D | **0.99** | **0.99** | 0.71 | 0.98 |
 | 6 clusters in 30-D noise | **0.94** | 0.87 | 0.18 | 0.94 |
 | varied density | 0.93 | **0.95** | 0.78 | 0.90 |
-| anisotropic | 0.32 | **0.99** | 0.95 | 0.78 |
+| anisotropic | **1.00** | 0.99 | 0.95 | 0.78 |
 | two moons | 0.60 | **1.00** | **1.00** | 0.56 |
 | circles | 0.53 | 0.96 | **1.00** | 0.00 |
-| SDSS objects (class) | 0.48 | 0.53 | **0.61** | 0.35 |
+| SDSS objects (class) | 0.47 | 0.50 | **0.61** | 0.35 |
 
 GACA's main view is the stronger method on overlapping, Gaussian-like groups,
 varied densities and noisy dimensions. The linked view, which AutoGACA
@@ -244,17 +247,52 @@ digits 0.56).
 | Data | GACA | Isolation Forest | LOF | HDBSCAN |
 |---|---|---|---|---|
 | blobs + planted anomalies | **1.00** (1.00) | 0.97 (1.00) | **1.00** (1.00) | 0.01 (0.67) |
-| company-like + planted | **0.84** (1.00) | 0.62 (1.00) | 0.76 (1.00) | 0.45 (0.76) |
+| company-like + planted | **0.80** (1.00) | 0.62 (1.00) | 0.76 (1.00) | 0.45 (0.76) |
 | breast cancer, 5% malignant | **0.47** (0.95) | 0.32 (0.91) | **0.47** (0.94) | 0.05 (0.53) |
-| SDSS, quasars thinned to 1% | 0.15 (0.96) | **0.32** (0.96) | 0.03 (0.55) | 0.02 (0.60) |
-| SDSS, white dwarfs (~1%) | 0.04 (0.90) | **0.06** (0.94) | 0.01 (0.47) | 0.01 (0.52) |
-| KDD Cup 99 attacks | 0.03 (0.41) | **0.36** (0.91) | 0.03 (0.36) | 0.03 (0.25) |
+| SDSS, quasars thinned to 1% | 0.18 (0.96) | **0.26** (0.95) | 0.02 (0.57) | 0.05 (0.77) |
+| SDSS, white dwarfs (~1%) | 0.04 (0.91) | **0.05** (0.93) | 0.01 (0.49) | 0.01 (0.50) |
+| KDD Cup 99 attacks | 0.09 (0.79) | **0.36** (0.91) | 0.03 (0.36) | 0.03 (0.25) |
 
 GACA ranks isolated anomalies best and flags precisely: on the planted sets it
-flags 0.2 to 0.7% of rows and catches them all, where Isolation Forest flags 9
-to 16%. It is weaker when the "anomalies" are a dense group of their own (a
-thousand similar quasars, or the floods of identical connections in KDD Cup,
-where all density methods fail).
+flags 0.2 to 2.9% of rows and catches them all, where Isolation Forest flags 9
+to 16%. Anomalies that form a dense group of their own (floods of identical
+connections in KDD Cup) were a blind spot of every density method. Weighting
+rare clusters in the score (`rare_share`) lifted GACA's ROC AUC there from
+0.41 to 0.79, though Isolation Forest stays ahead on that set.
+
+**Public datasets from other domains** (`experiments/benchmark_openml.py`,
+five OpenML clustering sets and two standard outlier sets; ARI, or average
+precision for anomalies):
+
+| Dataset (domain) | GACA | GACA linked | GACA best level\* | HDBSCAN | K-Means (true k) |
+|---|---|---|---|---|---|
+| banknote-authentication (finance) | 0.05 | **0.53** | 0.27 | 0.18 | 0.03 |
+| seeds (agriculture) | 0.66 | 0.51 | 0.66 | 0.34 | **0.69** |
+| ecoli (biology) | **0.74** | 0.44 | **0.74** | 0.04 | 0.51 |
+| segment (image analysis) | 0.11 | 0.10 | **0.49** | 0.25 | 0.11 |
+| pendigits (handwriting) | 0.51 | **0.71** | 0.65 | 0.25 | 0.54 |
+| mean | 0.41 | 0.46 | 0.56 | 0.21 | 0.38 |
+
+\*Chosen with the labels: what the hierarchy contains, not what a user gets
+automatically.
+
+| Anomalies (domain) | GACA | Isolation Forest | LOF |
+|---|---|---|---|
+| mammography (medicine, 2.3% anomalous) | 0.14 (0.82) | **0.22** (0.86) | 0.12 (0.77) |
+| shuttle (aerospace, 7.2% anomalous) | 0.65 (0.98) | **0.98** (1.00) | 0.12 (0.55) |
+
+These sets were kept out of development: the level-choice rule and the
+rare-group weighting were designed on the earlier benchmark and then checked
+here once.
+
+- **Clustering:** the automatic choice rose from a mean ARI of 0.30 to 0.41,
+  ahead of HDBSCAN (0.21) and of K-Means given the true number of classes
+  (0.38). The hierarchy holds still better levels (0.56 when picked with the
+  labels), so choosing the level remains the main room for improvement.
+- **Anomalies, shuttle:** the rare-group weighting raised GACA from AP
+  0.26/AUC 0.80 to 0.65/0.98. Isolation Forest is still better on both
+  outlier sets. GACA flags far fewer rows (0.6 to 1.6%, against 10 to 14%),
+  so its flags are precise but miss most of these anomalies.
 
 **Scale** (5-D data; seconds, and peak memory of the process):
 
@@ -268,6 +306,32 @@ Streamed GACA keeps memory flat. AutoGACA adds a fixed ~10 s for choosing γ,
 and in memory it holds the whole table (the CLI's `--chunksize` mode does not).
 Isolation Forest and K-Means are faster at every size; the speed advantage is
 over density-based clustering.
+
+## The mathematics
+
+[docs/theory.md](https://github.com/henrivuorinen/GACA/blob/main/docs/theory.md)
+explains the reasoning behind GACA's behaviour and the post-thesis design
+choices, and says for each part whether it is proved, approximated, or
+experimental. Its main new result is a **resolution law**. For two Suns
+(the point masses clusters become), it is proved that:
+
+- **Exact gap map:** one step shrinks the gap g by the factor
+  1 − η[r·b/(a + b·r) + r·a/(b + a·r)], with masses a, b and r = e^{−g²/2h²}.
+- **Inevitable collapse:** two isolated Suns always merge, faster and faster.
+- **Merge time:** it obeys explicit two-sided bounds.
+- **Critical gap:** separations survive T iterations only beyond
+  **Δ\*(T) = h√(2 ln T)·(1 + o(1))**, where h = 1/√(2γ) is the kernel
+  width. That is about 2.9 h for the default T = 20, and further for unequal
+  masses: a Lone Sun next to a heavy Sun is absorbed from further away.
+
+For clusters that still have a spread, a mean-field model (not proved, and
+matched by simulation to within 0.1 h) indicates two more things. GACA
+separates overlapping groups that show no density dip between them, which
+explains its advantage on such data in the benchmark. And the long plateaus
+seen in the thesis follow from the √(ln T) growth. A practical rule follows,
+available as `--resolution`: γ ≈ 5/Δ_min² separates groups at least Δ_min
+apart.
+`experiments/resolution_law.py` reproduces all numbers.
 
 ## Using the algorithm directly
 
@@ -441,6 +505,7 @@ gaca/            the package: Solar Genesis and assignment (genesis.py), the
 tests/           pytest suite (mass conservation, Lone Suns, estimator, AutoGACA, CLI)
 examples/        runnable demo on synthetic data; sdss/ fetches public SDSS
                  data and shows AutoGACA on it
+docs/            theory.md: the mathematics (resolution law and design choices)
 experiments/     the scripts behind every thesis table and figure, plus
                  improvements_benchmark.py (thesis vs current defaults)
 figures/         images used in this README

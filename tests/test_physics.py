@@ -94,3 +94,10 @@ def test_members_point_to_the_sun_each_row_condensed_into():
                                           epsilon=EPSILON, return_members=True)
     assert members.shape == (len(X),)
     assert np.array_equal(np.bincount(members, minlength=len(suns)), masses)
+
+
+def test_critical_gap_matches_the_two_sun_map_and_grows_slowly():
+    from gaca import critical_gap
+    assert 3.0 < critical_gap(20, spread=0.0) < 3.3      # docs/theory.md, compact limit
+    assert critical_gap(20, spread=1.0) > critical_gap(20, spread=0.0)
+    assert critical_gap(200, spread=0.0) < 1.35 * critical_gap(20, spread=0.0)   # sqrt(ln T)
