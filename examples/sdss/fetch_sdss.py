@@ -23,6 +23,13 @@ service; no account is needed. The files are written to data/ (git-ignored).
         cluster in one piece, as friends-of-friends group finders do with a
         longer linking length along the line of sight.
 
+    data/sdss_timeline.csv
+        60,000 objects in the order they were observed (column mjd, the
+        observation date): 30,000 from the original SDSS survey (2000 to
+        2008), then 30,000 from BOSS (from December 2009), which targeted
+        more distant galaxies and quasars. A real, documented change in the
+        data, for trying drift monitoring.
+
     python examples/sdss/fetch_sdss.py
 """
 import io
@@ -54,6 +61,23 @@ WHERE s.class = 'GALAXY' AND s.zWarning = 0 AND s.z BETWEEN 0.01 AND 0.05
 """
 
 
+TIMELINE = """
+SELECT TOP {n} s.specObjID, s.plate, s.mjd, s.ra, s.dec, s.z AS redshift, s.class, s.subClass,
+       s.dered_u AS u, s.dered_g AS g, s.dered_r AS r, s.dered_i AS i, s.dered_z AS z
+FROM SpecPhoto s
+WHERE s.zWarning = 0 AND s.ra BETWEEN 120 AND 240 AND s.dec BETWEEN 0 AND 60 AND {where}
+"""
+
+
+def add_colours(df):
+    mags = df[["u", "g", "r", "i", "z"]].where(df[["u", "g", "r", "i", "z"]] > -1000)
+    df["u_g"] = mags["u"] - mags["g"]
+    df["g_r"] = mags["g"] - mags["r"]
+    df["r_i"] = mags["r"] - mags["i"]
+    df["i_z"] = mags["i"] - mags["z"]
+    return df
+
+
 def query(sql, attempts=4):
     """Run a query, retrying when the public server is temporarily slow."""
     params = urllib.parse.urlencode({"cmd": " ".join(sql.split()), "format": "csv"})
@@ -78,12 +102,7 @@ def main():
     os.makedirs(OUT, exist_ok=True)
 
     print("Downloading SDSS objects...")
-    obj = query(OBJECTS)
-    mags = obj[["u", "g", "r", "i", "z"]].where(obj[["u", "g", "r", "i", "z"]] > -1000)
-    obj["u_g"] = mags["u"] - mags["g"]
-    obj["g_r"] = mags["g"] - mags["r"]
-    obj["r_i"] = mags["r"] - mags["i"]
-    obj["i_z"] = mags["i"] - mags["z"]
+    obj = add_colours(query(OBJECTS))
     path = os.path.join(OUT, "sdss_objects.csv")
     obj.to_csv(path, index=False)
     print(f"  {len(obj):,} rows -> {path}")
@@ -102,6 +121,15 @@ def main():
     path = os.path.join(OUT, "sdss_galaxy_positions.csv")
     pos.to_csv(path, index=False)
     print(f"  {len(pos):,} galaxies -> {path}")
+
+    print("Downloading the survey timeline (original SDSS, then BOSS)...")
+    legacy = query(TIMELINE.format(n=30000, where="s.plate < 3000"))
+    boss = query(TIMELINE.format(n=30000, where="s.plate > 3500"))
+    tl = add_colours(pd.concat([legacy, boss], ignore_index=True))
+    tl = tl.sort_values(["mjd", "specObjID"]).reset_index(drop=True)
+    path = os.path.join(OUT, "sdss_timeline.csv")
+    tl.to_csv(path, index=False)
+    print(f"  {len(tl):,} objects, observed {tl.mjd.min()} to {tl.mjd.max()} (MJD) -> {path}")
 
 
 if __name__ == "__main__":

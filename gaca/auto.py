@@ -26,6 +26,7 @@ from scipy.spatial import cKDTree
 from sklearn.decomposition import PCA
 from sklearn.metrics import adjusted_rand_score
 
+from .genesis import resolution_to_gamma
 from .model import GACA
 
 ID_NAME = re.compile(r'(id|idx|index|key|uuid)$', re.IGNORECASE)   # objid, specObjID, row_index
@@ -176,7 +177,7 @@ class Preprocessor:
     scale : {'robust', 'none'}
         'robust' log-transforms count-like columns (non-negative, skewed, wide
         range) and scales each column by its median and interquartile range. 'none' uses the values as they are, for
-        data whose distances are already meaningful (e.g. positions in Mpc);
+        data whose distances are already meaningful (e.g. coordinates in km);
         gamma is then in the data's own units.
     max_dims : int
         If more columns remain than this, project with PCA to between 5 (or
@@ -343,6 +344,93 @@ class Preprocessor:
         df, _ = _as_frame(data)
         return self._scaled(df)
 
+    def values(self, data):
+        """The used columns in their original units, with placeholders and
+        missing values replaced by the column median (used for cluster rules)."""
+        df, _ = _as_frame(data)
+        cols = []
+        for c in self.used_:
+            raw = np.asarray(df[c])
+            v, _ = _to_numeric(raw.astype(float) if raw.dtype == bool else raw)
+            for code in self.sentinels_.get(c, ()):
+                v = np.where(v == code, np.nan, v)
+            cols.append(np.where(np.isfinite(v), v, self.fill_[c]))
+        return np.column_stack(cols)
+
+
+def _fmt_threshold(x):
+    """A readable threshold: 3 significant digits, no exponent for ordinary sizes."""
+    if x == 0 or 1e-3 <= abs(x) < 1e6:
+        return f"{x:.3g}" if abs(x) < 1000 else f"{x:,.0f}"
+    return f"{x:.2e}"
+
+
+def cluster_rule(V, names, member, max_depth=3, max_rows=20000, random_state=0):
+    """A short rule in the original column units that picks out a cluster.
+
+    A shallow decision tree separates the cluster's rows (``member``) from the
+    rest; the leaf predicting the cluster with the best F1 score gives the
+    rule, its conditions on one column merged into an interval. Returns
+    dict(text, conditions, precision, recall) measured on all rows, or None
+    if the cluster is empty."""
+    from sklearn.tree import DecisionTreeClassifier
+    if not member.any():
+        return None
+    rng = np.random.default_rng(random_state)
+    idx = np.arange(len(V))
+    if len(V) > max_rows:            # keep every member up to half the sample
+        pos, neg = idx[member], idx[~member]
+        pos = rng.choice(pos, min(len(pos), max_rows // 2), replace=False)
+        neg = rng.choice(neg, min(len(neg), max_rows - len(pos)), replace=False)
+        idx = np.r_[pos, neg]
+    tree = DecisionTreeClassifier(max_depth=max_depth, class_weight='balanced',
+                                  min_samples_leaf=max(5, int(0.02 * member[idx].sum())),
+                                  random_state=random_state).fit(V[idx], member[idx])
+    t = tree.tree_
+    best = None
+
+    def walk(node, conds):
+        nonlocal best
+        if t.children_left[node] == -1:
+            if t.value[node][0].argmax() != 1:
+                return
+            mask = np.ones(len(V), bool)
+            for j, op, thr in conds:
+                mask &= (V[:, j] <= thr) if op == '<=' else (V[:, j] > thr)
+            tp = (mask & member).sum()
+            if tp == 0:
+                return
+            prec, rec = tp / mask.sum(), tp / member.sum()
+            f1 = 2 * prec * rec / (prec + rec)
+            if best is None or f1 > best[0]:
+                best = (f1, conds, prec, rec)
+            return
+        j, thr = t.feature[node], t.threshold[node]
+        walk(t.children_left[node], conds + [(j, '<=', thr)])
+        walk(t.children_right[node], conds + [(j, '>', thr)])
+
+    walk(0, [])
+    if best is None:
+        return dict(text=None, conditions=[], precision=0.0, recall=0.0)
+    _, conds, prec, rec = best
+    lo, hi = {}, {}
+    for j, op, thr in conds:                       # one interval per column
+        if op == '>':
+            lo[j] = max(lo.get(j, -np.inf), thr)
+        else:
+            hi[j] = min(hi.get(j, np.inf), thr)
+    parts = []
+    for j in sorted(set(lo) | set(hi), key=lambda j: [c[0] for c in conds].index(j)):
+        a, b = lo.get(j), hi.get(j)
+        if a is not None and b is not None:
+            parts.append(f"{_fmt_threshold(a)} < {names[j]} ≤ {_fmt_threshold(b)}")
+        elif a is not None:
+            parts.append(f"{names[j]} > {_fmt_threshold(a)}")
+        else:
+            parts.append(f"{names[j]} ≤ {_fmt_threshold(b)}")
+    return dict(text=" and ".join(parts), conditions=parts,
+                precision=float(prec), recall=float(rec))
+
 
 def _median_sq_dist(Z, rng, m=4000):
     i = rng.integers(len(Z), size=m)
@@ -383,7 +471,7 @@ def _agreement(a, b, min_rows=10):
 
 def select_gamma(Z, grid=None, n_seeds=4, sweep_size=2000, eval_size=3000,
                  min_share=0.01, min_size=10, max_lone=0.10, min_stability=0.8,
-                 link_tau=None, random_state=0, n_jobs=None):
+                 link_tau=None, random_state=0, n_jobs=None, finer_within=0.1):
     """Choose the bandwidth from the data (thesis Sec. 5.2, automated).
 
     gamma is swept as c / s2, where s2 is the median squared distance between
@@ -401,7 +489,9 @@ def select_gamma(Z, grid=None, n_seeds=4, sweep_size=2000, eval_size=3000,
     than ``max_lone`` of rows are Lone or the subsamples agree less than
     ``min_stability``. Without that bar, featureless data (one Gaussian) yields
     a "best" split that is just noise: its stability stays around 0.6 to 0.75,
-    while real structure in the tests scored 0.89 or more. Other plateaus are returned as
+    while real structure in the tests scored 0.89 or more. Among equally long
+    plateaus, the finest one whose stability is within ``finer_within`` of the
+    most stable is chosen (``finer_within=None``: the most stable one). Other plateaus are returned as
     alternative resolutions, and ``plateaus`` lists every plateau (at most six),
     coarse to fine, for the cluster hierarchy.
 
@@ -495,6 +585,18 @@ def select_gamma(Z, grid=None, n_seeds=4, sweep_size=2000, eval_size=3000,
             stab = np.mean([sweep[i]['stability'] for i in run])
             return len(run), int(round(stab / 0.02)), run[0]
         runs.sort(key=run_key, reverse=True)
+        if finer_within is not None:
+            # Among the longest plateaus, take the finest whose stability is
+            # within finer_within of the best: a stability estimated from four
+            # subsamples does not tell 0.99 from 0.94, and preferring the more
+            # stable plateau in such ties kept choosing views that were too
+            # coarse.
+            mean_stab = lambda run: np.mean([sweep[i]['stability'] for i in run])
+            longest = [run for run in runs if len(run) == len(runs[0])]
+            top = max(mean_stab(run) for run in longest)
+            first = max((run for run in longest if mean_stab(run) >= top - finer_within),
+                        key=lambda run: run[0])
+            runs = [first] + [run for run in runs if run is not first]
         pick = best_of(runs[0])
         alts = [best_of(run) for run in runs[1:4]]
         plateaus = sorted(best_of(run) for run in runs[:6])   # by gamma, coarse to fine
@@ -528,7 +630,14 @@ class AutoGACA:
     bandwidth : float, optional
         The kernel width h in the units of the clustering space, instead of
         gamma (gamma = 1 / (2 h^2)). With ``scale='none'`` this is a physical
-        length, e.g. 1.0 for 1 Mpc when positions are in Mpc. Overrides gamma.
+        length, e.g. 2.0 for 2 km when coordinates are in km. Overrides gamma.
+    resolution : float, optional
+        The smallest gap between groups that should stay separate, in the units
+        of the clustering space (physical units with ``scale='none'``). gamma is
+        derived from the resolution law of docs/theory.md (h is about
+        resolution / 3.3 for the default 20 iterations). It assumes groups no
+        wider than about a third of the resolution. Overrides gamma; cannot be
+        combined with bandwidth.
     link_tau : float, optional
         Saddle linking for curved or elongated clusters (e.g. 0.6). Off by
         default.
@@ -546,6 +655,12 @@ class AutoGACA:
     n_jobs : int, optional
         Threads for the bandwidth sweep and the hierarchy fits (default: up to
         8). Results do not depend on it.
+    rare_share : float
+        In the anomaly score, a cluster holding less than this share of the
+        rows pulls with weight share / rare_share instead of 1. Rows in a
+        small group far from the bulk of the data then score as anomalous,
+        while the flags (which rows are anomalies) do not change. 0 turns it
+        off (default 0.05).
     link_view : bool
         Also cluster with saddle linking (link_tau=0.6, its own automatic
         bandwidth) as an alternative view: better for curved or elongated
@@ -577,9 +692,9 @@ class AutoGACA:
 
     def __init__(self, columns=None, exclude=None, scale='robust', max_dims=10,
                  gamma='auto', link_tau=None, sample_size=5000, kappa=1e-3,
-                 min_cluster_size=10, bandwidth=None, hierarchy=True,
+                 min_cluster_size=10, bandwidth=None, resolution=None, hierarchy=True,
                  random_state=0, n_jobs=None, link_view=True, separate_modes=True,
-                 verbose=False):
+                 rare_share=0.05, verbose=False):
         self.columns = columns
         self.exclude = exclude
         self.scale = scale
@@ -590,11 +705,13 @@ class AutoGACA:
         self.kappa = kappa
         self.min_cluster_size = min_cluster_size
         self.bandwidth = bandwidth
+        self.resolution = resolution
         self.hierarchy = hierarchy
         self.random_state = random_state
         self.n_jobs = n_jobs
         self.link_view = link_view
         self.separate_modes = separate_modes
+        self.rare_share = rare_share
         self.verbose = verbose
 
     def _log(self, msg):
@@ -611,9 +728,14 @@ class AutoGACA:
         self._log(f"{len(self.preprocessor_.used_)} columns used, GACA space "
                   f"{Z.shape[1]}-D")
 
+        if self.bandwidth is not None and self.resolution is not None:
+            raise ValueError("give either bandwidth or resolution, not both")
         if self.bandwidth is not None:
             self.gamma_selection_ = None
             gamma = 1.0 / (2.0 * float(self.bandwidth) ** 2)
+        elif self.resolution is not None:
+            self.gamma_selection_ = None
+            gamma = resolution_to_gamma(self.resolution)
         elif self.gamma == 'auto':
             self._log("Selecting gamma...")
             self.gamma_selection_ = select_gamma(Z, link_tau=self.link_tau,
@@ -646,7 +768,19 @@ class AutoGACA:
         regular_members = np.isin(self.model_.core_labels_, regular)
         self._regular_tree = (cKDTree(self.model_.core_[regular_members])
                               if regular_members.any() else None)
+        # Pull weight of each regular member in the anomaly score: 1, or
+        # share / rare_share for a cluster rarer than rare_share.
+        share = {int(k): counts[k] / max(len(raw), 1) for k in regular}
+        member_sun = self.model_.core_labels_[regular_members]
+        self._regular_w = np.array([min(1.0, share[int(k)] / self.rare_share)
+                                    if self.rare_share else 1.0 for k in member_sun])
         self._set_outputs(df, Z, raw)
+        # Reference for drift monitoring: cluster shares (anomalies last) and the
+        # anomaly rate on the data the model was fitted on.
+        counts = np.bincount(self.labels_[self.labels_ >= 0], minlength=self.n_clusters_)
+        shares = np.r_[counts, (self.labels_ < 0).sum()] / len(self.labels_)
+        self.reference_ = dict(shares=shares, anomaly_rate=float(self.anomaly_.mean()),
+                               n_groups=int(self.anomaly_group_.max() + 1))
         self._build_hierarchy(Z)
         self.clusters_ = self._describe(df)
         self._fit_link_view(df)
@@ -658,7 +792,7 @@ class AutoGACA:
         self.linked_labels_ = None
         self.link_agreement_ = None
         if not (self.link_view and self.link_tau is None and self.bandwidth is None
-                and self.gamma == 'auto'):
+                and self.resolution is None and self.gamma == 'auto'):
             return
         self._log("Linked view...")
         alt = AutoGACA(columns=self.columns, exclude=self.exclude, scale=self.scale,
@@ -860,16 +994,19 @@ class AutoGACA:
 
         Only coreset members of regular clusters pull: members of Lone Suns and
         anomaly groups do not, so the copies of a sampled anomaly cannot make
-        each other look ordinary. A row that is itself a coreset member does not
+        each other look ordinary. Members of clusters rarer than ``rare_share``
+        pull with a weight proportional to their cluster's share, so a small
+        isolated group also scores as unusual. A row that is itself a coreset member does not
         count its own pull. The sum is taken in log space, so rows far from
         everything keep a finite score that grows with distance."""
         m = self.model_
         if self._regular_tree is None:
             return np.full(len(Z), np.inf)
         K = min(m.n_neighbors, self._regular_tree.n)
-        dist, _ = self._regular_tree.query(Z, k=K, workers=-1)
+        dist, idx = self._regular_tree.query(Z, k=K, workers=-1)
         dist = dist.reshape(len(Z), -1)
-        logw = -m.gamma_clustering * dist ** 2
+        idx = idx.reshape(len(Z), -1)
+        logw = -m.gamma_clustering * dist ** 2 + np.log(self._regular_w[idx])
         logw[:, 0] = np.where(dist[:, 0] == 0, -np.inf, logw[:, 0])
         top = logw.max(axis=1, keepdims=True)
         top = np.where(np.isfinite(top), top, 0.0)
@@ -897,6 +1034,118 @@ class AutoGACA:
             linked = np.asarray(self.linked_.assign(df)['gaca_cluster']) \
                 if self._has_pandas() else self.linked_.assign(df)['gaca_cluster']
         return self._frame(labels, groups, self._score(Z), self._hier_labels(Z, labels), linked)
+
+    def compare(self, truth, baselines=False, max_baseline_rows=200_000):
+        """Score the clustering against known labels for the fitted rows.
+
+        ``truth`` holds one label per fitted row (any type). The labels are used
+        only here, after clustering. Returns a dict with:
+
+        * ``methods``: per method, the adjusted Rand index (ARI), normalised
+          mutual information (NMI), the number of clusters, and the share of
+          rows put in a cluster. Methods are GACA's ``gaca_cluster``, the linked
+          view, and the best-matching hierarchy level, plus, with ``baselines``,
+          K-Means given the true number of classes and HDBSCAN (minimum cluster
+          size 1% of rows), both run on the same preprocessed data.
+        * ``clusters``: per GACA cluster, its size and the known labels it
+          contains, with shares, and its purity (share of the commonest label).
+
+        Rows GACA leaves unclustered (anomalies) count as one extra label in
+        the ARI, as in the benchmark. The result is also stored in
+        ``comparison_`` for the report."""
+        from sklearn.metrics import normalized_mutual_info_score
+        truth = np.asarray(truth)
+        if len(truth) != len(self.labels_):
+            raise ValueError("truth needs one label per fitted row")
+        names, y = np.unique(truth.astype(str), return_inverse=True)
+
+        def score(name, labels, note=''):
+            covered = labels >= 0
+            return dict(method=name, note=note, ari=float(adjusted_rand_score(y, labels)),
+                        nmi=float(normalized_mutual_info_score(y, labels)),
+                        clusters=int(len(set(labels[covered].tolist()))),
+                        covered=float(covered.mean()))
+
+        methods = [score('GACA', self.labels_, 'gaca_cluster')]
+        if getattr(self, 'linked_labels_', None) is not None:
+            methods.append(score('GACA, linked view', self.linked_labels_, 'gaca_linked_cluster'))
+        if len(self.levels_) > 1:
+            best = max(range(len(self.levels_)),
+                       key=lambda i: adjusted_rand_score(y, self.levels_[i]['labels']))
+            methods.append(score('GACA, best hierarchy level', self.levels_[best]['labels'],
+                                 f"gaca_level_{best + 1}"))
+        if baselines:
+            from sklearn.cluster import HDBSCAN, KMeans
+            Z = self.Z_
+            methods.append(score('K-Means (given the true k)',
+                                 KMeans(len(names), n_init=10,
+                                        random_state=self.random_state).fit_predict(Z),
+                                 f"k = {len(names)}"))
+            if len(Z) <= max_baseline_rows:
+                methods.append(score('HDBSCAN',
+                                     HDBSCAN(min_cluster_size=max(5, len(Z) // 100)).fit_predict(Z),
+                                     'minimum cluster size 1% of rows'))
+        clusters = []
+        for k in range(self.n_clusters_):
+            m = self.labels_ == k
+            if not m.any():
+                continue
+            counts = np.bincount(y[m], minlength=len(names))
+            order = np.argsort(-counts)
+            clusters.append(dict(cluster=k, size=int(m.sum()),
+                                 purity=float(counts[order[0]] / m.sum()),
+                                 labels=[(str(names[j]), float(counts[j] / m.sum()))
+                                         for j in order[:3] if counts[j]]))
+        self.comparison_ = dict(n_labels=int(len(names)), methods=methods, clusters=clusters)
+        return self.comparison_
+
+    def drift(self, result, max_shift=0.1, max_anomaly_ratio=3.0, alpha=1e-3):
+        """Compare a batch of assigned rows with the data the model was fitted on.
+
+        ``result`` is the output of :meth:`assign` for the batch. Returns a dict:
+
+        * ``cluster_shift``: total variation distance between the batch's
+          cluster shares and the fitted shares (anomalies count as a category;
+          0 = same mix, 1 = disjoint). ``cluster_p`` is the chi-square test of
+          the batch counts against the fitted shares.
+        * ``anomaly_rate`` and ``anomaly_ratio`` (batch rate / fitted rate), with
+          ``anomaly_p``, the one-sided binomial test for an increase.
+        * ``new_groups``: anomaly groups first seen in this batch.
+        * ``drift``: True when the cluster mix moved by more than ``max_shift``,
+          or the anomaly rate rose more than ``max_anomaly_ratio`` times (and by
+          at least one percentage point), with the change significant at
+          ``alpha``. ``reasons`` says which.
+
+        Both a size and a significance condition are required: small batches
+        fluctuate, and large batches make any tiny difference significant."""
+        from scipy.stats import binomtest, chisquare
+        get = (lambda k: np.asarray(result[k]))
+        labels = get('gaca_cluster')
+        groups = get('gaca_anomaly_group')
+        n = len(labels)
+        ref = self.reference_
+        k = len(ref['shares']) - 1
+        counts = np.r_[np.bincount(labels[labels >= 0], minlength=k)[:k], (labels < 0).sum()]
+        shares = counts / max(n, 1)
+        shift = 0.5 * float(np.abs(shares - ref['shares']).sum())
+        expected = np.maximum(ref['shares'], 0.5 / max(n, 1))
+        expected = expected / expected.sum() * n
+        cluster_p = float(chisquare(counts, expected).pvalue) if n else 1.0
+        rate = float((labels < 0).mean()) if n else 0.0
+        base = max(ref['anomaly_rate'], 1.0 / max(len(self.labels_), 1))
+        anomaly_p = float(binomtest(int((labels < 0).sum()), n, base,
+                                    alternative='greater').pvalue) if n else 1.0
+        known = getattr(self, '_groups_seen', ref['n_groups'])
+        new_groups = int(len(set(groups[groups >= known].tolist())))
+        self._groups_seen = max(known, int(groups.max()) + 1 if (groups >= 0).any() else known)
+        reasons = []
+        if shift > max_shift and cluster_p < alpha:
+            reasons.append(f"cluster mix moved by {shift:.2f}")
+        if (rate > max_anomaly_ratio * base and rate - base > 0.01 and anomaly_p < alpha):
+            reasons.append(f"anomaly rate {100 * rate:.1f}% vs {100 * base:.1f}% when fitted")
+        return dict(rows=n, cluster_shift=shift, cluster_p=cluster_p, anomaly_rate=rate,
+                    anomaly_ratio=rate / base, anomaly_p=anomaly_p, new_groups=new_groups,
+                    drift=bool(reasons), reasons="; ".join(reasons))
 
     @staticmethod
     def _has_pandas():
@@ -949,6 +1198,11 @@ class AutoGACA:
                             distinctive=[(used[j], float(diff[j])) for j in order
                                          if abs(diff[j]) >= 0.25]))
         self.tree_ = self._describe_tree(S, used, overall)
+        # A short rule per cluster, in the original units of the columns.
+        V = self.preprocessor_.values(df)
+        for c in out:
+            c['rule'] = cluster_rule(V, used, self.labels_ == c['cluster'],
+                                     random_state=self.random_state)
         return out
 
     def _describe_tree(self, S, used, overall):
@@ -1010,6 +1264,9 @@ class AutoGACA:
         if sel is not None:
             lines.append(f"  gamma: {self.gamma_:.4g} (auto, stability {sel['stability']:.2f}"
                          f"{'' if sel['found'] else '; no stable multi-cluster plateau found'})")
+        elif self.resolution is not None:
+            lines.append(f"  gamma: {self.gamma_:.4g} (from resolution {self.resolution:g}: "
+                         f"kernel width {1 / np.sqrt(2 * self.gamma_):.3g})")
         else:
             lines.append(f"  gamma: {self.gamma_:.4g} (given)")
         lines.append(f"  clusters: {self.n_clusters_}, anomalies: {int(self.anomaly_.sum())} rows "
@@ -1018,6 +1275,10 @@ class AutoGACA:
             d = ', '.join(f"{n} {'+' if v > 0 else '-'}" for n, v in c['distinctive'][:3])
             lines.append(f"    cluster {c['cluster']}: {c['size']:,} rows ({c['share']:.1%})"
                          + (f"  [{d}]" if d else ''))
+            rule = c.get('rule')
+            if rule and rule['text'] and rule['precision'] >= 0.5 and rule['recall'] >= 0.5:
+                lines.append(f"        ≈ {rule['text']}  (precision {rule['precision']:.0%}, "
+                             f"recall {rule['recall']:.0%})")
         if self.n_clusters_ > 10:
             lines.append(f"    ... {self.n_clusters_ - 10} more")
         if self.linked_labels_ is not None:
@@ -1032,9 +1293,12 @@ class AutoGACA:
                 + " clusters per level (* = the level in gaca_cluster)")
         return "\n".join(lines)
 
-    def report(self, path, data=None, title=None):
+    def report(self, path, data=None, title=None, truth_name=None, drift=None):
         """Write a self-contained HTML report. Pass the original ``data`` to
-        include the original column values of the top anomalies."""
+        include the original column values of the top anomalies. After
+        :meth:`compare`, the report includes the comparison (``truth_name``
+        labels it); ``drift`` is a list of :meth:`drift` results, one per
+        chunk, to chart."""
         from .report import write_report
-        write_report(self, path, data=data, title=title)
+        write_report(self, path, data=data, title=title, truth_name=truth_name, drift=drift)
         return path
